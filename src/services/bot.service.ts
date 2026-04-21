@@ -17,7 +17,7 @@ import { logError } from "../utils/logger.js";
 import { withRetry } from "../utils/retry.js";
 import { handleBotTextCommand } from "./bot-config-commands.js";
 import { approveTier, approveFollowUp as approveFollowUpGuarded } from "./approve-guard.js";
-import { ensureHtml } from "../utils/text-utils.js";
+import { ensureHtml, stripHtml } from "../utils/text-utils.js";
 
 // ── Types ──
 
@@ -431,7 +431,7 @@ outcome.wasEdited,
       where: { id: data.leadId },
       data: { draftSubject: finalSubject, draftBodyHtml: finalBody },
     });
-    await this.replaceWithSavedCard(context, lead, "tier1", finalSubject, finalBody, userName);
+    await this.replaceWithSavedCard(context, lead, "tier1", finalSubject, stripHtml(finalBody), userName);
   }
 
   private async saveDraftTier2(context: TurnContext, data: SubmitData, userName: string): Promise<void> {
@@ -449,7 +449,7 @@ outcome.wasEdited,
       where: { id: data.leadId },
       data: { draftSubject: finalSubject, draftBodyHtml: finalBody },
     });
-    await this.replaceWithSavedCard(context, lead, "tier2", finalSubject, finalBody, userName);
+    await this.replaceWithSavedCard(context, lead, "tier2", finalSubject, stripHtml(finalBody), userName);
   }
 
   private async saveDraftFollowUp(context: TurnContext, data: SubmitData, userName: string): Promise<void> {
@@ -471,7 +471,7 @@ outcome.wasEdited,
     });
     await this.replaceWithSavedFollowUpCard(
       context, data.queueId, entry.businessName, entry.email ?? "",
-      finalSubject, finalBody, entry.geminiReasoning ?? "", userName,
+      finalSubject, stripHtml(finalBody), entry.geminiReasoning ?? "", userName,
     );
   }
 
@@ -1153,15 +1153,4 @@ outcome.wasEdited,
     const activityId = await this.proactiveSend("devops", card);
     return { activityId };
   }
-}
-
-// ── Utility ──
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<\/(p|div)>/gi, "\n\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .trim();
 }
