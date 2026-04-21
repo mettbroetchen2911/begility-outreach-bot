@@ -1,5 +1,6 @@
 import { withRetry } from "../utils/retry.js";
 import { wrapEmailInTemplate } from "../utils/email-template.js";
+import { ensureHtml } from "../utils/text-utils.js";
 import { prisma } from "../utils/prisma.js";
 
 export interface DraftResult {
@@ -35,7 +36,7 @@ export class EmailService {
       const suppressed = await prisma.suppression.findUnique({ where: { email: to.toLowerCase() } });
       if (suppressed) throw new Error(`Email ${to} is suppressed — aborting draft`);
       
-      const formattedHtml = wrapEmailInTemplate(html);
+      const formattedHtml = wrapEmailInTemplate(ensureHtml(html));
 
       const res = await fetch(
         `https://graph.microsoft.com/v1.0/users/${this.senderEmail}/messages`,
@@ -76,7 +77,7 @@ export class EmailService {
   async updateDraft(messageId: string, subject: string, bodyHtml: string): Promise<void> {
     return withRetry(async () => {
       const token = await this.getToken();
-      const formattedHtml = wrapEmailInTemplate(bodyHtml);
+      const formattedHtml = wrapEmailInTemplate(ensureHtml(bodyHtml));
       const res = await fetch(
         `https://graph.microsoft.com/v1.0/users/${this.senderEmail}/messages/${messageId}`,
         {
