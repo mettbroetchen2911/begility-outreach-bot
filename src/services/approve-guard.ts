@@ -85,10 +85,11 @@ export async function approveTier(input: ApproveInputTier): Promise<ApproveOutco
 
   // Normalise edits
   const finalSubject = input.editedSubject?.trim() || lead.draftSubject || "";
-  const finalBody    = input.editedBody?.trim() || "";
+  const rawBody      = input.editedBody?.trim() || "";
+  const finalBody    = rawBody ? plainToHtml(rawBody) : (lead.draftBodyHtml ?? "");
   const wasEdited = Boolean(
     (input.editedSubject?.trim() && input.editedSubject.trim() !== lead.draftSubject) ||
-    (input.editedBody?.trim() && input.editedBody.trim() !== stripHtml(lead.draftBodyHtml ?? ""))
+    (rawBody && rawBody !== stripHtml(lead.draftBodyHtml ?? ""))
   );
 
   try {
@@ -213,7 +214,8 @@ export async function approveFollowUp(input: ApproveInputFollowUp): Promise<Appr
 
   const wasEdited = Boolean(input.editedSubject?.trim() || input.editedBody?.trim());
   const finalSubject = input.editedSubject?.trim() || (lead.draftSubject ?? "");
-  const finalBody    = input.editedBody?.trim() || "";
+  const rawBody      = input.editedBody?.trim() || "";
+  const finalBody    = rawBody ? plainToHtml(rawBody) : (lead.draftBodyHtml ?? "");
 
   try {
     if (!entry.draftId) {
@@ -281,9 +283,14 @@ async function rollbackFollowUp(queueId: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
+function plainToHtml(text: string): string {
+  return text
+    .split(/\n{2,}/)
+    .map((para) => para.trim())
+    .filter(Boolean)
+    .map((para) => `<p>${para.replace(/\n/g, "<br/>")}</p>`)
+    .join("\n");
+}
 
 function stripHtml(html: string): string {
   return html
