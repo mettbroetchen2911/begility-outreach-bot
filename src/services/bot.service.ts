@@ -422,9 +422,10 @@ outcome.wasEdited,
     if (!lead.outlookDraftId) throw new Error("No Outlook draft found — cannot save");
 
     const finalSubject = data.editedSubject?.trim() || lead.draftSubject || "";
-    const finalBody    = data.editedBody?.trim() || "";
+    const rawBody      = data.editedBody?.trim() || "";
+    const finalBody    = rawBody ? plainToHtml(rawBody) : (lead.draftBodyHtml ?? "");
 
-    await this.emailService.updateDraft(lead.outlookDraftId, finalSubject, finalBody);
+    await this.emailService.updateDraft(..., finalSubject, finalBody);
     await prisma.lead.update({
       where: { id: data.leadId },
       data: { draftSubject: finalSubject, draftBodyHtml: finalBody },
