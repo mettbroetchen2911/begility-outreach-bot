@@ -2,6 +2,7 @@ import { prisma } from "../utils/prisma.js";
 import { EmailService } from "./email.service.js";
 import { recordSend } from "./send-recorder.js";
 import { logError } from "../utils/logger.js";
+import { stripHtml, ensureHtml } from "../utils/text-utils.js";
 
 const email = new EmailService();
 
@@ -86,11 +87,11 @@ export async function approveTier(input: ApproveInputTier): Promise<ApproveOutco
   // Normalise edits
   const finalSubject = input.editedSubject?.trim() || lead.draftSubject || "";
   const rawBody      = input.editedBody?.trim() || "";
-  const finalBody    = rawBody ? plainToHtml(rawBody) : (lead.draftBodyHtml ?? "");
   const wasEdited = Boolean(
     (input.editedSubject?.trim() && input.editedSubject.trim() !== lead.draftSubject) ||
     (rawBody && rawBody !== stripHtml(lead.draftBodyHtml ?? ""))
   );
+  const finalBody    = wasEdited ? ensureHtml(rawBody) : (lead.draftBodyHtml ?? "");
 
   try {
     if (!lead.outlookDraftId) {
@@ -212,10 +213,13 @@ export async function approveFollowUp(input: ApproveInputFollowUp): Promise<Appr
     }
   }
 
-  const wasEdited = Boolean(input.editedSubject?.trim() || input.editedBody?.trim());
   const finalSubject = input.editedSubject?.trim() || (lead.draftSubject ?? "");
   const rawBody      = input.editedBody?.trim() || "";
-  const finalBody    = rawBody ? plainToHtml(rawBody) : (lead.draftBodyHtml ?? "");
+  const wasEdited = Boolean(
+    (input.editedSubject?.trim() && input.editedSubject.trim() !== lead.draftSubject) ||
+    (rawBody && rawBody !== stripHtml(lead.draftBodyHtml ?? ""))
+  );
+  const finalBody    = wasEdited ? ensureHtml(rawBody) : (lead.draftBodyHtml ?? "");
 
   try {
     if (!entry.draftId) {
@@ -228,8 +232,8 @@ export async function approveFollowUp(input: ApproveInputFollowUp): Promise<Appr
       await prisma.lead.update({
         where: { id: lead.id },
         data: {
-          ...(input.editedSubject?.trim() && { draftSubject: input.editedSubject.trim() }),
-          ...(input.editedBody?.trim() && { draftBodyHtml: input.editedBody.trim() }),
+          ...(input.editedSubject?.trim() && { draftSubject: finalSubject }),
+          ...(rawBody && { draftBodyHtml: finalBody }),
         },
       });
     }
@@ -290,15 +294,6 @@ function plainToHtml(text: string): string {
     .filter(Boolean)
     .map((para) => `<p>${para.replace(/\n/g, "<br/>")}</p>`)
     .join("\n");
-}
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<\/(p|div)>/gi, "\n\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .trim();
 }
 
 function quickHash(s: string): string {
