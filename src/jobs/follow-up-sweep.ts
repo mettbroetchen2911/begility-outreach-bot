@@ -4,19 +4,11 @@ import { BotService } from "../services/bot.service.js";
 import { AIService } from "../services/ai.service.js";
 import { logError } from "../utils/logger.js";
 import { isKillSwitchActive } from "./bounce-monitor.js";
+import { stripHtml } from "../utils/text-utils.js";
 
 const emailSvc = new EmailService();
 const botSvc = new BotService();
 const ai = new AIService();
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<\/(p|div)>/gi, "\n\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .trim();
-}
 
 export async function runFollowUpSweep(): Promise<{
   processed: number;
