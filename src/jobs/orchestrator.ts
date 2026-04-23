@@ -70,7 +70,7 @@ for (const lead of leads) {
           ownerName: research.owner_name ?? lead.ownerName,
           email: research.email ?? lead.email,
           phone: research.phone ?? lead.phone,
-          instagram: research.instagram ?? lead.instagram,
+          instagram: (research as any).instagram ?? lead.instagram, // <-- Added (research as any)
           websiteUrl: research.website ?? lead.websiteUrl,
           businessDescription: research.description ?? lead.businessDescription,
         },
