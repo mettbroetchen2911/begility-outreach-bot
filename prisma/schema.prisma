@@ -117,6 +117,8 @@ model Lead {
 
   teamsCardActivityId String?
 
+  conversationId      String?  @db.Text
+
   notes               String?  @db.Text
 
   suppressions        Suppression[]
@@ -129,6 +131,7 @@ model Lead {
   @@index([businessName, city])
   @@index([normalizedName])
   @@index([websiteDomain])
+  @@index([conversationId])
 }
 
 model Suppression {
@@ -223,3 +226,15 @@ model ScrapeCache {
 
    @@index([expiresAt])
  }
+
+model GraphSubscription {
+  id                 String    @id @default(uuid()) @db.Uuid
+  createdAt          DateTime  @default(now())
+  subscriptionId     String    @unique
+  resource           String
+  changeType         String
+  expirationDateTime DateTime
+  renewedAt          DateTime?
+
+  @@index([expirationDateTime])
+}
