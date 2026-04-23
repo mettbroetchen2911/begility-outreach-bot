@@ -199,6 +199,7 @@ await prisma.lead.update({
           data: {
             status: "waiting_concierge",
             outlookDraftId: outlookDraft.messageId,
+            conversationId: outlookDraft.conversationId,
             draftCreatedAt: new Date(),
             teamsCardActivityId: activityId,
             enrichmentLock: false,
@@ -223,6 +224,7 @@ await prisma.lead.update({
           data: {
             status: "waiting_concierge",  // ← was "draft_created", now goes through approval
             outlookDraftId: outlookDraft.messageId,
+            conversationId: outlookDraft.conversationId,
             draftCreatedAt: new Date(),
             teamsCardActivityId: activityId,
             enrichmentLock: false,
