@@ -20,11 +20,43 @@ export interface DiscoveryScanResult {
 }
 
 const MAX_PER_QUERY = parseInt(process.env.MAX_RESULTS_PER_QUERY ?? "15", 10);
+const DISCOVERY_MAX_TOKENS = parseInt(process.env.DISCOVERY_MAX_TOKENS ?? "8192", 10);
 
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) throw new Error("GEMINI_API_KEY environment variable is required");
 
 const client = new GoogleGenAI({ apiKey });
+
+function salvageJsonArray(raw: string): unknown[] {
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+  } catch { /* fall through to salvage */ }
+
+  const openIdx = raw.indexOf("[");
+  if (openIdx === -1) return [];
+  const body = raw.slice(openIdx + 1);
+
+  const salvaged: unknown[] = [];
+  let depth = 0, start = -1, inString = false, escape = false;
+
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") { if (depth === 0) start = i; depth++; }
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        try { salvaged.push(JSON.parse(body.slice(start, i + 1))); } catch { /* skip incomplete */ }
+        start = -1;
+      }
+    }
+  }
+  return salvaged;
+}
 
 export async function discoverBusinesses(
   query: string,
@@ -79,7 +111,7 @@ If you find zero matching businesses in this area, return an empty array: []`;
         systemInstruction:
           "You are a B2B business discovery researcher for a UK AI consultancy. Return valid JSON arrays only. No preamble. Only include businesses you found via Google or LinkedIn — never fabricate entries. Prefer UK founder-led / owner-managed SMEs.",
         temperature: 0.1,
-        maxOutputTokens: 4096,
+        maxOutputTokens: DISCOVERY_MAX_TOKENS,
         tools: [{ googleSearch: {} }],
       },
     });
@@ -87,13 +119,19 @@ If you find zero matching businesses in this area, return an empty array: []`;
     const rawText = response.text ?? "";
     const cleaned = rawText.replace(/^```(?:json)?\n?/g, "").replace(/\n?```$/g, "").trim();
 
-    let parsed: unknown[];
-    try {
-      parsed = JSON.parse(cleaned);
-      if (!Array.isArray(parsed)) parsed = [];
-    } catch {
-      console.error(`Discovery parse failed for "${query}" in ${regionLabel}. Raw: ${rawText.slice(0, 300)}`);
-      parsed = [];
+    const parsed = salvageJsonArray(cleaned);
+
+    if (parsed.length === 0 && cleaned.length > 20) {
+      console.error(
+        `Discovery parse salvage empty for "${query}" in ${regionLabel}. ` +
+        `Raw length=${rawText.length}. First 2000: ${rawText.slice(0, 2000)}`
+      );
+    } else if (parsed.length < MAX_PER_QUERY && rawText.length >= DISCOVERY_MAX_TOKENS * 3) {
+      // Likely truncation — log the tail so we can see what got cut
+      console.warn(
+        `Discovery likely truncated for "${query}": salvaged ${parsed.length}, ` +
+        `raw length=${rawText.length}. Tail: ${rawText.slice(-500)}`
+      );
     }
 
     const businesses: DiscoveredBusiness[] = parsed
