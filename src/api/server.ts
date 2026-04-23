@@ -6,6 +6,7 @@ import { apiKeyGuard } from "../middleware/auth.js";
 import botMessagesRouter from "./bot-messages.js";
 import inboundReplyRouter from "./inbound-reply.js";
 import webhooksRouter from "./webhooks.js";
+import graphNotificationsRouter from "./graph-notifications.js";
 
 // Jobs
 import { runDiscoverySweep } from "../discovery/discovery-sweep.js";
@@ -13,6 +14,7 @@ import { runOrchestrator } from "../jobs/orchestrator.js";
 import { runFollowUpSweep } from "../jobs/follow-up-sweep.js";
 import { runDailyDigest } from "../jobs/daily-digest.js";
 import { runBounceMonitor } from "../jobs/bounce-monitor.js";
+import { ensureGraphSubscription } from "../jobs/graph-subscription-manager.js";
 
 const app = express();
 
@@ -30,6 +32,10 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 
 // ── Bot Framework endpoint — BEFORE apiKeyGuard (bot uses its own auth) ──
 app.use("/", botMessagesRouter);
+
+// Graph change notifications webhook — BEFORE apiKeyGuard
+// (authenticated via clientState + validationToken handshake, not API key)
+app.use("/", graphNotificationsRouter);
 
 // API key guard — protects remaining endpoints except /health
 app.use(apiKeyGuard);
@@ -71,6 +77,12 @@ app.post("/jobs/daily-digest", async (_req, res) => {
 
 app.post("/jobs/bounce-monitor", async (_req, res) => {
   try { res.json(await runBounceMonitor()); }
+  catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// Graph subscription lifecycle endpoint — called by Cloud Scheduler every 12h
+app.post("/jobs/graph-subscription-renew", async (_req, res) => {
+  try { res.json(await ensureGraphSubscription()); }
   catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -137,6 +149,14 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const server = app.listen(PORT, () => {
   console.log(`Lead Engine on :${PORT} (${process.env.NODE_ENV ?? "dev"})`);
+
+  // Bootstrap the Graph sent-items subscription on boot if configured.
+  // No-op if the existing sub still has enough headroom.
+  if (process.env.GRAPH_NOTIFY_URL && process.env.GRAPH_CLIENT_STATE_SECRET) {
+    ensureGraphSubscription()
+      .then((r) => console.log(`[graph-sub] bootstrap: ${r.action} ${r.subscriptionId}${r.reason ? " (" + r.reason + ")" : ""}`))
+      .catch((e) => console.error(`[graph-sub] bootstrap failed: ${e instanceof Error ? e.message : String(e)}`));
+  }
 });
 
 // ── Graceful shutdown (Cloud Run sends SIGTERM) ──
