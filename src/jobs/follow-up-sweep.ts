@@ -71,7 +71,7 @@ export async function runFollowUpSweep(): Promise<{
           description: typeof research.description === "string" ? research.description : undefined,
           instagram: typeof research.instagram === "string" ? research.instagram : undefined,
           location: typeof research.location === "string" ? research.location : undefined,
-        },
+        } as any, 
       });
 
       const draft = await emailSvc.createDraft(lead.email, followUp.subject_line, followUp.email_body_html);
