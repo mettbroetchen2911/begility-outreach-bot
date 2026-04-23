@@ -93,7 +93,12 @@ export async function runFollowUpSweep(): Promise<{
       // Update lead — prevents re-queuing
       await prisma.lead.update({
         where: { id: lead.id },
-        data: { followUpDraftId: draft.messageId, followUpQueuedAt: new Date(), status: "follow_up_queued" },
+        data: {
+          followUpDraftId: draft.messageId,
+          followUpQueuedAt: new Date(),
+          status: "follow_up_queued",
+          ...(draft.conversationId && { conversationId: draft.conversationId }),
+        },
       });
 
       // Send editable approval card via bot (no HMAC URLs needed)
