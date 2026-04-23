@@ -6,11 +6,23 @@ import { prisma } from "../utils/prisma.js";
 export interface DraftResult {
   messageId: string;
   webLink: string | null;
+  conversationId: string | null;
 }
 
 export interface SendResult {
   messageId: string;
   sentAt: Date;
+}
+
+export interface GraphMessageSummary {
+  id: string;
+  subject: string | null;
+  conversationId: string | null;
+  isDraft: boolean;
+  sentDateTime: string | null;
+  from?: { emailAddress?: { address?: string; name?: string } };
+  toRecipients?: Array<{ emailAddress?: { address?: string } }>;
+  body?: { contentType: string; content: string };
 }
 
 export class EmailService {
@@ -52,11 +64,34 @@ export class EmailService {
         }
       );
       if (!res.ok) throw new Error(`Graph createDraft [${res.status}]: ${await res.text()}`);
-      const data = (await res.json()) as { id: string; webLink?: string };
+      const data = (await res.json()) as { id: string; webLink?: string; conversationId?: string };
       const webLink = data.webLink
       ?? `https://outlook.office365.com/owa/?ItemID=${encodeURIComponent(data.id)}&exvsurl=1&viewmodel=ReadMessageItem`;
-      return { messageId: data.id, webLink };
+      return {
+        messageId: data.id,
+        webLink,
+        conversationId: data.conversationId ?? null,
+      };
     }, "createDraft");
+  }
+
+  async getMessageById(messageId: string): Promise<GraphMessageSummary | null> {
+    return withRetry(async () => {
+      const token = await this.getToken();
+      const url =
+        `https://graph.microsoft.com/v1.0/users/${this.senderEmail}/messages/${messageId}` +
+        `?$select=id,subject,conversationId,isDraft,sentDateTime,from,toRecipients,body`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`Graph getMessage [${res.status}]: ${await res.text()}`);
+      return (await res.json()) as GraphMessageSummary;
+    }, "getMessageById");
+  }
+
+  async getGraphToken(): Promise<string> {
+    return this.getToken();
   }
 
   async sendDraft(messageId: string): Promise<SendResult> {
