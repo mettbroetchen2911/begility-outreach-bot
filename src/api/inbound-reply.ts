@@ -21,19 +21,142 @@ interface InboundPayload {
   receivedAt?: string;
 }
 
+// ─── Auto-responder detection ───────────────────────────────────────────────
+const AUTO_SUBJECT_PATTERNS: RegExp[] = [
+  /^(auto(matic)?[- ]?(reply|response)|out of (the )?office|ooo\b|away from)/i,
+  /\bauto[- ]?reply\b/i,
+  /\bon holiday\b/i,
+  /\bannual leave\b/i,
+];
+
+const AUTO_BODY_PATTERNS: RegExp[] = [
+  /currently (out of the office|on annual leave|on holiday)/i,
+  /i (am|'m) (currently )?(out of (the )?office|away|on leave)/i,
+  /thank you for (your email|reaching out|contacting us).{0,80}(will (get back|respond|reply)|within \d+ (hours|business days))/i,
+  /this is an automated (reply|response|message)/i,
+  /(we'll|we will|someone will) be (in touch|with you) (within|shortly|soon)/i,
+];
+
+function detectAutoResponder(subject: string, body: string): { isAuto: boolean; reason?: string } {
+  for (const re of AUTO_SUBJECT_PATTERNS) {
+    if (re.test(subject)) return { isAuto: true, reason: `subject:${re.source.slice(0, 40)}` };
+  }
+  for (const re of AUTO_BODY_PATTERNS) {
+    if (re.test(body)) return { isAuto: true, reason: `body:${re.source.slice(0, 40)}` };
+  }
+  return { isAuto: false };
+}
+
+// ─── Bounce detection ───────────────────────────────────────────────────────
+const BOUNCE_FROM_PATTERNS: RegExp[] = [
+  /^(postmaster|mailer-daemon|mail-daemon|no-?reply)@/i,
+];
+
+const BOUNCE_SUBJECT_PATTERNS: RegExp[] = [
+  /^(undeliverable|delivery (status notification|has failed)|mail delivery (failed|system))/i,
+  /failure notice/i,
+  /returned mail/i,
+];
+
+function isBounceMessage(fromEmail: string, subject: string): boolean {
+  return (
+    BOUNCE_FROM_PATTERNS.some((re) => re.test(fromEmail)) ||
+    BOUNCE_SUBJECT_PATTERNS.some((re) => re.test(subject))
+  );
+}
+
+function extractBouncedAddress(body: string): string | null {
+  const patterns = [
+    /Original-Recipient:\s*rfc822;\s*([^\s;]+)/i,
+    /Final-Recipient:\s*rfc822;\s*([^\s;]+)/i,
+    /(?:to|for)\s+<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?\s+(?:because|failed|could not)/i,
+    /<([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>/i,
+  ];
+  for (const re of patterns) {
+    const m = body.match(re);
+    if (m?.[1]) return m[1].toLowerCase().trim();
+  }
+  return null;
+}
+
 router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
   const { fromEmail, subject, textBody, receivedAt } = req.body as InboundPayload;
-
   if (!fromEmail || !textBody) {
     res.status(400).json({ error: "fromEmail and textBody are required" });
     return;
   }
-
   const normalEmail = fromEmail.toLowerCase().trim();
   const replyTime = receivedAt ? new Date(receivedAt) : new Date();
 
   try {
-    // IMMEDIATE suppression — before any AI call
+    // ─── BOUNCE ROUTING (no suppression on the sender; suppression on bounced recipient) ───
+    if (isBounceMessage(normalEmail, subject ?? "")) {
+      const bounced = extractBouncedAddress(textBody);
+      if (bounced) {
+        const lead = await prisma.lead.findFirst({
+          where: { email: bounced },
+          orderBy: { lastContactedAt: "desc" },
+        });
+        await prisma.suppression.upsert({
+          where: { email: bounced },
+          create: { email: bounced, reason: "bounced", leadId: lead?.id },
+          update: { reason: "bounced", leadId: lead?.id },
+        });
+        if (lead) {
+          await prisma.lead.update({
+            where: { id: lead.id },
+            data: {
+              status: "verification_failed",
+              emailVerified: false,
+              outlookDraftId: null,
+              notes: `${lead.notes ?? ""}\n[${replyTime.toISOString()}] Bounced — address ${bounced} is dead`.trim(),
+            },
+          });
+          await botSvc.sendReplyAlert(
+            lead,
+            "bounced",
+            `Email bounced — ${bounced} is dead. Research a replacement contact or close.`,
+            textBody.slice(0, 300),
+          ).catch(() => { /* swallow */ });
+        }
+        await logError({
+          scenario: "S4_Reply", module: "bounce", code: "BOUNCE_DETECTED",
+          message: `Bounce for ${bounced}`, leadId: lead?.id,
+        }).catch(() => {});
+      }
+      res.status(200).json({ success: true, classification: "bounce", bouncedAddress: bounced });
+      return;
+    }
+
+    // ─── AUTO-RESPONDER ROUTING (no suppression — lead stays in the sequence) ───
+    const auto = detectAutoResponder(subject ?? "", textBody);
+    if (auto.isAuto) {
+      const lead = await prisma.lead.findFirst({
+        where: {
+          email: normalEmail,
+          status: { in: ["outreach_sent", "follow_up_queued", "follow_up_sent"] },
+        },
+        orderBy: { lastContactedAt: "desc" },
+      });
+      if (lead) {
+        await prisma.lead.update({
+          where: { id: lead.id },
+          data: {
+            notes: `${lead.notes ?? ""}\n[${replyTime.toISOString()}] Auto-responder (${auto.reason}) — left in sequence`.trim(),
+          },
+        });
+        await botSvc.sendReplyAlert(
+          lead,
+          "auto_reply",
+          `Auto-responder detected (${auto.reason}). Lead left in sequence, no suppression applied.`,
+          textBody.slice(0, 300),
+        ).catch(() => {});
+      }
+      res.status(200).json({ success: true, classification: "auto_responder", reason: auto.reason, leadMatched: Boolean(lead) });
+      return;
+    }
+
+    // ─── REAL REPLY — existing flow below, unchanged ────────────────────────
     await prisma.suppression.upsert({
       where: { email: normalEmail },
       create: { email: normalEmail, reason: "replied" },
@@ -127,6 +250,13 @@ router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
           goodbye.subject_line,
           goodbye.email_body_html
         );
+
+        if (draft.conversationId && draft.conversationId !== lead.conversationId) {
+          await prisma.lead.update({
+            where: { id: lead.id },
+            data: { conversationId: draft.conversationId },
+          });
+        }
 
         // Store draft on a follow-up queue entry for approval tracking
         const queueEntry = await prisma.followUpQueue.create({
