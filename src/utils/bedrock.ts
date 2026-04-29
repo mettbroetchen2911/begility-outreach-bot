@@ -47,7 +47,7 @@ function client(): BedrockRuntimeClient {
 export async function preflightBedrock(): Promise<void> {
   const modelId =
     process.env.BEDROCK_SONNET_MODEL_ID ??
-    "anthropic.claude-sonnet-4-5-20250929-v1:0";
+    "eu.anthropic.claude-sonnet-4-6";
   const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "eu-west-2";
 
   try {
@@ -73,9 +73,9 @@ export async function preflightBedrock(): Promise<void> {
       `Underlying error: ${msg}\n\n` +
       `Common causes:\n` +
       `  1. AWS creds not set or invalid (check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)\n` +
-      `  2. Sonnet 4.5 not enabled in the chosen region (request access in Bedrock console → Model access)\n` +
+      `  2. Sonnet 4.6 not enabled in the chosen region (request access in Bedrock console → Model access)\n` +
       `  3. IAM role missing bedrock:InvokeModel permission\n` +
-      `  4. Wrong region — Sonnet 4.5 is available in us-east-1, us-west-2, eu-central-1, etc.`
+      `  4. Wrong region — Sonnet 4.6 is available in us-east-1, us-west-2, eu-central-1, etc.`
     );
   }
 }
@@ -99,7 +99,7 @@ export async function callClaudeSonnet(opts: BedrockClaudeOptions): Promise<stri
   const modelId =
     opts.modelOverride ??
     process.env.BEDROCK_SONNET_MODEL_ID ??
-    "anthropic.claude-sonnet-4-5-20250929-v1:0";
+    "eu.anthropic.claude-sonnet-4-6";
 
   const body = {
     anthropic_version: "bedrock-2023-05-31",
