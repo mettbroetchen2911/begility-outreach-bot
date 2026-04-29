@@ -1,21 +1,39 @@
 import { prisma } from "../utils/prisma.js";
 import { getNicheConfig } from "../config/niche.js";
-import { discoverBusinesses, DiscoveredBusiness } from "./gemini-discovery.js";
-import { checkDuplicate, normalizeBusinessName, extractDomain } from "../utils/dedup.js";
+import {
+  checkDuplicate,
+  normalizeBusinessName,
+  extractDomain,
+  normalizePhoneE164,
+} from "../utils/dedup.js";
 import { validateWebsite } from "../utils/website-validator.js";
+import { discoverFromCompaniesHouse } from "./companies-house-discovery.js";
+import { discoverFromPlaces } from "./places-discovery.js";
 
 const TARGET_NEW = parseInt(process.env.MAX_NEW_LEADS_PER_SWEEP ?? "50", 10);
 const MAX_ATTEMPTS = parseInt(process.env.MAX_DISCOVERY_ATTEMPTS ?? "30", 10);
-const MAX_RUNTIME_MS = parseInt(process.env.DISCOVERY_MAX_RUNTIME_MS ?? "1500000", 10); // 25 min
+const MAX_RUNTIME_MS = parseInt(process.env.DISCOVERY_MAX_RUNTIME_MS ?? "1500000", 10);
 const SCAN_COOLDOWN_HOURS = parseInt(process.env.SCAN_COOLDOWN_HOURS ?? "48", 10);
 const VALIDATE_WEBSITES = (process.env.VALIDATE_WEBSITES ?? "true").toLowerCase() === "true";
+const USE_PLACES_FALLBACK = (process.env.DISCOVERY_USE_PLACES_FALLBACK ?? "true").toLowerCase() === "true";
 
 type StopReason = "target_hit" | "attempts_exhausted" | "timeout" | "no_progress";
 
 interface SweepState {
-  totalNew: number; totalDiscovered: number; totalDuplicates: number;
-  totalSkipped: number; totalInvalidWebsites: number; attempts: number;
-  runs: Array<{ query: string; region: string; discovered: number; new: number; phase: number; skipped?: boolean }>;
+  totalNew: number;
+  totalDiscovered: number;
+  totalDuplicates: number;
+  totalSkipped: number;
+  totalInvalidWebsites: number;
+  totalRejectedFinancialStanding: number;
+  attempts: number;
+  runs: Array<{
+    source: string;
+    location: string;
+    discovered: number;
+    new: number;
+    skipped?: boolean;
+  }>;
   startTime: number;
 }
 
@@ -26,184 +44,275 @@ function shouldStop(s: SweepState): StopReason | null {
   return null;
 }
 
-/**
- * Single query × region scan. Reads and writes `state` in place.
- */
-async function scanQueryRegion(
-  query: string,
-  region: Awaited<ReturnType<typeof getNicheConfig>>["discoveryRegions"][number],
-  state: SweepState,
-  phase: number,
-): Promise<void> {
-  const regionKey = `${region.lat},${region.lng},${region.radiusMeters}`;
-  const start = Date.now();
-  state.attempts++;
+// ---------------------------------------------------------------------------
+// Companies House scan (primary)
+// ---------------------------------------------------------------------------
 
-  let scanNew = 0, scanDuplicates = 0, scanInvalidSites = 0;
-  let businesses: DiscoveredBusiness[] = [];
+async function scanCompaniesHouse(
+  location: string,
+  sicCodes: string[],
+  incorporatedBefore: string,
+  state: SweepState,
+): Promise<void> {
+  state.attempts++;
+  const start = Date.now();
+  console.log(`  [CH] Scanning ${location} (${sicCodes.length} SIC codes, incorporated before ${incorporatedBefore})...`);
+
+  let scanNew = 0, scanDuplicates = 0;
 
   try {
-    console.log(`  [phase ${phase}] Scanning: "${query}" in ${region.label}...`);
-    const result = await discoverBusinesses(query, region);
-    businesses = result.businesses;
-    state.totalDiscovered += businesses.length;
-    console.log(`    Gemini found ${businesses.length} businesses`);
+    const cooldownCutoff = new Date(Date.now() - SCAN_COOLDOWN_HOURS * 3600_000);
+    const recent = await prisma.discoveryRun.findFirst({
+      where: {
+        source: "companies_house",
+        query: sicCodes.join(","),
+        region: location,
+        ranAt: { gte: cooldownCutoff },
+      },
+      orderBy: { ranAt: "desc" },
+    });
+    if (recent) {
+      console.log(`    Skipping CH/${location} — scanned ${Math.round((Date.now() - recent.ranAt.getTime()) / 3600_000)}h ago`);
+      state.runs.push({ source: "companies_house", location, discovered: 0, new: 0, skipped: true });
+      state.totalSkipped++;
+      return;
+    }
 
-    for (const biz of businesses) {
+    const result = await discoverFromCompaniesHouse({ location, sicCodes, incorporatedBefore });
+    state.totalDiscovered += result.businesses.length;
+    state.totalRejectedFinancialStanding += result.rejectedFinancialStanding;
+    console.log(`    CH found ${result.businesses.length} qualifying businesses (${result.rejectedFinancialStanding} rejected on financial standing)`);
+
+    for (const biz of result.businesses) {
       if (state.totalNew >= TARGET_NEW) break;
-      if (!biz.businessName?.trim()) continue;
 
       const dedup = await checkDuplicate({
-        businessName: biz.businessName.trim(),
-        website: biz.website,
+        businessName: biz.businessName,
         city: biz.city,
+        outwardPostcode: biz.outwardPostcode,
+        companiesHouseNumber: biz.companiesHouseNumber,
       });
       if (dedup.isDuplicate) {
-        console.log(`    DEDUP: "${biz.businessName}" matches "${dedup.matchedBusinessName}" (${dedup.matchType})`);
         scanDuplicates++;
         state.totalDuplicates++;
         continue;
       }
 
-      if (VALIDATE_WEBSITES && biz.website) {
-        const validation = await validateWebsite(biz.website);
+      await prisma.lead.create({
+        data: {
+          businessName: biz.businessName,
+          normalizedName: normalizeBusinessName(biz.businessName),
+          city: biz.city,
+          country: biz.country,
+          address: biz.address,
+          outwardPostcode: biz.outwardPostcode,
+          companiesHouseNumber: biz.companiesHouseNumber,
+          sicCodes: biz.sicCodes,
+          accountsCategory: biz.accountsCategory,
+          incorporatedOn: biz.incorporatedOn,
+          companyStatus: biz.companyStatus,
+          status: "new_lead",
+          discoverySource: "companies_house",
+          discoveryQuery: sicCodes.join(","),
+        },
+      });
+      scanNew++;
+      state.totalNew++;
+    }
+
+    await prisma.discoveryRun.create({
+      data: {
+        source: "companies_house",
+        query: sicCodes.join(","),
+        region: location,
+        leadsFound: scanNew,
+        totalResults: result.businesses.length,
+        durationMs: Date.now() - start,
+      },
+    }).catch(() => { /* best-effort */ });
+
+    state.runs.push({ source: "companies_house", location, discovered: result.businesses.length, new: scanNew });
+    console.log(`    → ${scanNew} new, ${scanDuplicates} dupes (${Date.now() - start}ms) | running total ${state.totalNew}/${TARGET_NEW}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`    CH scan failed: ${msg}`);
+    await prisma.errorLog.create({
+      data: {
+        scenarioName: "S0_Discovery", moduleName: "discovery-sweep",
+        errorCode: "CH_SCAN_FAILED", errorMessage: msg.slice(0, 4000), killSwitchFired: false,
+      },
+    }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Google Places scan (fallback — sole traders / partnerships not on CH)
+// ---------------------------------------------------------------------------
+
+async function scanPlaces(
+  query: string,
+  region: ReturnType<typeof getNicheConfig>["discoveryRegions"][number],
+  state: SweepState,
+): Promise<void> {
+  state.attempts++;
+  const start = Date.now();
+  const regionKey = `${region.lat},${region.lng},${region.radiusMeters}`;
+  console.log(`  [Places] "${query}" in ${region.label}...`);
+
+  let scanNew = 0, scanDuplicates = 0, scanInvalidSites = 0;
+
+  try {
+    const result = await discoverFromPlaces({
+      query,
+      locationBias: { lat: region.lat, lng: region.lng, radiusMeters: region.radiusMeters },
+    });
+    state.totalDiscovered += result.businesses.length;
+    console.log(`    Places found ${result.businesses.length} businesses`);
+
+    for (const biz of result.businesses) {
+      if (state.totalNew >= TARGET_NEW) break;
+      if (!biz.businessName?.trim()) continue;
+
+      const dedup = await checkDuplicate({
+        businessName: biz.businessName,
+        website: biz.website,
+        city: biz.city,
+        phone: biz.phone,
+        outwardPostcode: biz.outwardPostcode,
+        address: biz.address,
+      });
+      if (dedup.isDuplicate) {
+        scanDuplicates++;
+        state.totalDuplicates++;
+        continue;
+      }
+
+      let website: string | null = biz.website;
+      if (VALIDATE_WEBSITES && website) {
+        const validation = await validateWebsite(website);
         if (!validation.valid) {
-          console.log(`    INVALID SITE: "${biz.businessName}" — ${validation.reason}`);
           scanInvalidSites++;
           state.totalInvalidWebsites++;
-          biz.website = null;
+          website = null;
         }
       }
 
-      const normName = normalizeBusinessName(biz.businessName.trim());
-      const domain = extractDomain(biz.website);
       await prisma.lead.create({
         data: {
-          businessName: biz.businessName.trim(),
-          normalizedName: normName,
-          websiteDomain: domain,
+          businessName: biz.businessName,
+          normalizedName: normalizeBusinessName(biz.businessName),
+          websiteDomain: extractDomain(website),
+          websiteUrl: website,
           city: biz.city,
           country: biz.country,
-          websiteUrl: biz.website,
-          businessDescription: biz.description,
-          ownerName: biz.ownerName,
+          address: biz.address,
+          outwardPostcode: biz.outwardPostcode,
+          phone: biz.phone,
+          phoneE164: normalizePhoneE164(biz.phone),
+          googlePlaceId: biz.googlePlaceId,
+          googleRating: biz.rating,
           status: "new_lead",
-          discoverySource: "google_maps",
+          discoverySource: "google_places",
           discoveryQuery: query,
         },
       });
       scanNew++;
       state.totalNew++;
     }
+
+    await prisma.discoveryRun.create({
+      data: {
+        source: "google_places",
+        query,
+        region: regionKey,
+        leadsFound: scanNew,
+        totalResults: result.businesses.length,
+        durationMs: Date.now() - start,
+      },
+    }).catch(() => { /* best-effort */ });
+
+    state.runs.push({ source: "google_places", location: region.label, discovered: result.businesses.length, new: scanNew });
+    console.log(`    → ${scanNew} new, ${scanDuplicates} dupes, ${scanInvalidSites} invalid (${Date.now() - start}ms) | running total ${state.totalNew}/${TARGET_NEW}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`    Scan failed: ${msg}`);
+    console.error(`    Places scan failed: ${msg}`);
     await prisma.errorLog.create({
       data: {
         scenarioName: "S0_Discovery", moduleName: "discovery-sweep",
-        errorCode: "SCAN_FAILED", errorMessage: msg.slice(0, 4000), killSwitchFired: false,
+        errorCode: "PLACES_SCAN_FAILED", errorMessage: msg.slice(0, 4000), killSwitchFired: false,
       },
     }).catch(() => {});
   }
-
-  await prisma.discoveryRun.create({
-    data: {
-      source: "google_maps", query, region: regionKey,
-      leadsFound: scanNew, totalResults: businesses.length,
-      durationMs: Date.now() - start,
-    },
-  }).catch(() => { console.error("    Failed to record DiscoveryRun"); });
-
-  state.runs.push({ query, region: region.label, discovered: businesses.length, new: scanNew, phase });
-  console.log(`    → ${scanNew} new, ${scanDuplicates} dupes, ${scanInvalidSites} invalid (${Date.now() - start}ms) | running total ${state.totalNew}/${TARGET_NEW}`);
 }
+
+// ---------------------------------------------------------------------------
+// Public entrypoint
+// ---------------------------------------------------------------------------
 
 export async function runDiscoverySweep() {
   const config = getNicheConfig();
   const state: SweepState = {
     totalNew: 0, totalDiscovered: 0, totalDuplicates: 0,
-    totalSkipped: 0, totalInvalidWebsites: 0, attempts: 0,
-    runs: [], startTime: Date.now(),
+    totalSkipped: 0, totalInvalidWebsites: 0, totalRejectedFinancialStanding: 0,
+    attempts: 0, runs: [], startTime: Date.now(),
   };
+
+  const sicCodes = (process.env.COMPANIES_HOUSE_SIC_CODES ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  const locations = (process.env.COMPANIES_HOUSE_LOCATIONS ?? "")
+    .split(";").map((s) => s.trim()).filter(Boolean);
+  const incorporatedBefore = process.env.COMPANIES_HOUSE_INCORPORATED_BEFORE ?? "2023-01-01";
 
   console.log(
     `Discovery sweep: target=${TARGET_NEW}, max attempts=${MAX_ATTEMPTS}, ` +
-    `max runtime=${Math.round(MAX_RUNTIME_MS / 60000)}min, ` +
-    `queries=${config.discoveryQueries.length}, regions=${config.discoveryRegions.length}`
+    `max runtime=${Math.round(MAX_RUNTIME_MS / 60_000)}min`
   );
-  console.log(`  Fuzzy dedup: ENABLED | Website validation: ${VALIDATE_WEBSITES ? "ENABLED" : "DISABLED"}`);
+  console.log(`  Primary: Companies House — ${locations.length} locations × ${sicCodes.length} SIC codes`);
+  console.log(`  Fallback: Google Places — ${USE_PLACES_FALLBACK ? "ENABLED" : "DISABLED"}`);
+  console.log(`  Website validation: ${VALIDATE_WEBSITES ? "ENABLED" : "DISABLED"}`);
 
-  // ── Phase 1: normal pass, respecting cooldown ──
-  phase1: for (const query of config.discoveryQueries) {
-    for (const region of config.discoveryRegions) {
-      const cooldownCutoff = new Date(Date.now() - SCAN_COOLDOWN_HOURS * 3600000);
-      const regionKey = `${region.lat},${region.lng},${region.radiusMeters}`;
-      const recent = await prisma.discoveryRun.findFirst({
-        where: { query, region: regionKey, ranAt: { gte: cooldownCutoff } },
-        orderBy: { ranAt: "desc" },
-      });
-      if (recent) {
-        console.log(`  [phase 1] Skipping "${query}" in ${region.label} — scanned ${Math.round((Date.now() - recent.ranAt.getTime()) / 3600000)}h ago`);
-        state.runs.push({ query, region: region.label, discovered: 0, new: 0, phase: 1, skipped: true });
-        state.totalSkipped++;
-        continue;
-      }
-      await scanQueryRegion(query, region, state, 1);
+  // ── Phase 1: Companies House across all configured locations ──
+  if (sicCodes.length === 0 || locations.length === 0) {
+    console.warn("  Skipping CH phase — COMPANIES_HOUSE_SIC_CODES or COMPANIES_HOUSE_LOCATIONS unset");
+  } else {
+    phase1: for (const location of locations) {
+      await scanCompaniesHouse(location, sicCodes, incorporatedBefore, state);
       if (shouldStop(state)) break phase1;
     }
   }
 
-  // ── Phase 2: bypass cooldown on pairs we haven't hit yet this run ──
-  if (!shouldStop(state)) {
-    console.log(`Phase 2: ${state.totalNew}/${TARGET_NEW} — bypassing cooldown for missed pairs`);
+  // ── Phase 2: Google Places fallback for sole traders / partnerships ──
+  if (USE_PLACES_FALLBACK && !shouldStop(state)) {
+    console.log(`Phase 2: ${state.totalNew}/${TARGET_NEW} — Places fallback`);
     phase2: for (const query of config.discoveryQueries) {
       for (const region of config.discoveryRegions) {
-        const alreadyScanned = state.runs.some(r =>
-          r.phase === 1 && r.query === query && r.region === region.label && !r.skipped
-        );
-        if (alreadyScanned) continue;
-        await scanQueryRegion(query, region, state, 2);
+        await scanPlaces(query, region, state);
         if (shouldStop(state)) break phase2;
       }
     }
   }
 
-  // ── Phase 3: re-run — Gemini returns different businesses on repeat calls ──
-  let iter = 0;
-  while (!shouldStop(state)) {
-    iter++;
-    console.log(`Phase 3 (iter ${iter}): ${state.totalNew}/${TARGET_NEW}`);
-    const before = state.totalNew;
-    phase3: for (const query of config.discoveryQueries) {
-      for (const region of config.discoveryRegions) {
-        await scanQueryRegion(query, region, state, 3);
-        if (shouldStop(state)) break phase3;
-      }
-    }
-    if (state.totalNew === before) {
-      console.log(`Phase 3 iter ${iter} found nothing new — stopping`);
-      break;
-    }
-  }
+  const stopReason = shouldStop(state) ?? "completed";
+  const durationMin = Math.round((Date.now() - state.startTime) / 60_000);
 
-  const stopReason = shouldStop(state) ?? "no_progress";
-  const runtimeS = Math.round((Date.now() - state.startTime) / 1000);
   console.log(
-    `Discovery complete: ${state.totalNew}/${TARGET_NEW} new, ` +
-    `${state.totalDuplicates} dupes, ${state.totalInvalidWebsites} invalid, ` +
-    `${state.attempts} attempts, ${runtimeS}s. Reason: ${stopReason}`
+    `Discovery sweep complete: ${state.totalNew} new, ` +
+    `${state.totalDuplicates} duplicates, ${state.totalSkipped} skipped, ` +
+    `${state.totalInvalidWebsites} invalid sites, ` +
+    `${state.totalRejectedFinancialStanding} rejected on financial standing, ` +
+    `${state.attempts} attempts, ${durationMin}min, stop=${stopReason}`
   );
 
   return {
-    totalScans: state.runs.length,
-    totalDiscovered: state.totalDiscovered,
-    totalNew: state.totalNew,
-    totalDuplicates: state.totalDuplicates,
-    totalSkipped: state.totalSkipped,
-    totalInvalidWebsites: state.totalInvalidWebsites,
+    new: state.totalNew,
+    discovered: state.totalDiscovered,
+    duplicates: state.totalDuplicates,
+    skipped: state.totalSkipped,
+    invalidWebsites: state.totalInvalidWebsites,
+    rejectedFinancialStanding: state.totalRejectedFinancialStanding,
     attempts: state.attempts,
+    durationMs: Date.now() - state.startTime,
     stopReason,
-    runtimeS,
     runs: state.runs,
   };
 }

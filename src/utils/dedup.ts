@@ -1,46 +1,53 @@
 import { prisma } from "./prisma.js";
 
 // ---------------------------------------------------------------------------
-// Name Normalization
+// Name normalisation — DELIBERATELY MINIMAL
+//
+// We only strip:
+//   - Legal entity suffixes (ltd, limited, plc, llp, etc.)
+//   - Punctuation
+//   - Excess whitespace
+//
+// We do NOT strip sector words (recruitment, estate, lettings, etc.) because
+// they are often the only thing distinguishing two unrelated businesses
+// in the same town. "Mercer Recruitment" and "Mercer Estates" must NOT
+// collide.
 // ---------------------------------------------------------------------------
 
-// Common suffixes and noise words stripped during normalization
-const STRIP_SUFFIXES = [
-  // Legal entities
-  "ltd", "limited", "llc", "llp", "inc", "incorporated", "plc", "corp", "corporation",
-  "gmbh", "pty", "co", "company", "cic", "cio",
-  // Begility target-sector noise — recruitment / estate / trades / dentistry / wholesale / dealerships
-  "recruitment", "recruiters", "staffing", "talent", "search", "consultancy", "consulting", "associates", "partners", "group",
-  "estate", "estates", "agents", "agent", "lettings", "letting", "properties", "property", "homes",
-  "builders", "building", "construction", "contractors", "contracting", "services", "solutions",
-  "plumbing", "plumbers", "heating", "electrical", "electricians", "roofing", "roofers", "joinery", "joiners", "decorators",
-  "dental", "dentistry", "dentists", "orthodontics", "aesthetics", "clinic", "clinics", "practice",
-  "wholesale", "wholesalers", "distribution", "distributors", "supplies", "supply",
-  "motors", "motor", "autos", "auto", "cars", "car", "vehicles", "dealership",
-  // Location noise
-  "london", "manchester", "birmingham", "leeds", "bristol", "liverpool", "glasgow", "edinburgh", "cardiff", "uk",
-  // Generic
-  "the", "and", "&",
+const LEGAL_SUFFIXES = [
+  "ltd", "limited", "llc", "llp", "lp", "inc", "incorporated",
+  "plc", "corp", "corporation", "gmbh", "pty",
+  "co", "company", "cic", "cio", "sarl", "sa", "ag", "bv",
 ];
 
-const STRIP_REGEX = new RegExp(
-  `\\b(${STRIP_SUFFIXES.join("|")})\\b`,
+const LEGAL_SUFFIX_REGEX = new RegExp(
+  `\\b(${LEGAL_SUFFIXES.join("|")})\\b\\.?`,
   "gi"
 );
 
 export function normalizeBusinessName(name: string): string {
   return name
     .toLowerCase()
-    .replace(/[''`]/g, "")              // Strip apostrophes
-    .replace(/[^\w\s]/g, " ")           // Non-alphanumeric → space
-    .replace(STRIP_REGEX, "")           // Strip noise words
-    .replace(/\s+/g, " ")              // Collapse whitespace
+    .replace(/[''`""]/g, "")            // strip apostrophes / smart quotes
+    .replace(/&/g, " and ")             // & → "and"
+    .replace(LEGAL_SUFFIX_REGEX, "")    // strip "ltd", "limited", etc.
+    .replace(/[^\w\s]/g, " ")           // non-alphanumeric → space
+    .replace(/\s+/g, " ")               // collapse whitespace
     .trim();
 }
 
 // ---------------------------------------------------------------------------
-// Domain Extraction
+// Domain extraction — registered-root aware
+//
+// Treats `www.foo.co.uk`, `foo.co.uk`, `shop.foo.co.uk` as the same domain.
 // ---------------------------------------------------------------------------
+
+const STRIP_SUBDOMAINS = ["www", "m", "shop", "blog", "news", "careers", "jobs"];
+
+const COMPOUND_TLDS = [
+  "co.uk", "org.uk", "ltd.uk", "plc.uk", "me.uk", "net.uk", "ac.uk", "gov.uk",
+  "co.jp", "co.nz", "co.za", "com.au", "com.sg", "com.br",
+];
 
 export function extractDomain(url: string | null | undefined): string | null {
   if (!url) return null;
@@ -48,148 +55,213 @@ export function extractDomain(url: string | null | undefined): string | null {
     let normalized = url.trim().toLowerCase();
     if (!normalized.startsWith("http")) normalized = `https://${normalized}`;
     const parsed = new URL(normalized);
-    // Strip www. and return root domain
-    return parsed.hostname.replace(/^www\./, "") || null;
+    let host = parsed.hostname;
+
+    const parts = host.split(".");
+    while (parts.length > 2 && STRIP_SUBDOMAINS.includes(parts[0])) {
+      parts.shift();
+    }
+    host = parts.join(".");
+
+    const isCompound = COMPOUND_TLDS.some((tld) => host.endsWith(`.${tld}`));
+    const segments = host.split(".");
+    if (isCompound && segments.length > 3) {
+      return segments.slice(-3).join(".");
+    }
+    if (!isCompound && segments.length > 2) {
+      return segments.slice(-2).join(".");
+    }
+    return host || null;
   } catch {
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Similarity — Sørensen–Dice coefficient on bigrams
-// Fast, no dependencies, good for business name matching
+// E.164 phone normalisation (UK-default)
 // ---------------------------------------------------------------------------
 
-function bigrams(str: string): Set<string> {
-  const s = new Set<string>();
-  for (let i = 0; i < str.length - 1; i++) {
-    s.add(str.slice(i, i + 2));
+export function normalizePhoneE164(raw: string | null | undefined, defaultRegion = "GB"): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/[^\d+]/g, "");
+  if (!digits) return null;
+
+  if (digits.startsWith("+")) {
+    return digits.length >= 8 ? digits : null;
   }
-  return s;
+  if (defaultRegion === "GB") {
+    if (digits.startsWith("44")) return `+${digits}`;
+    if (digits.startsWith("0")) return `+44${digits.slice(1)}`;
+    if (digits.length >= 10) return `+44${digits}`;
+  }
+  return null;
 }
 
-export function diceCoefficient(a: string, b: string): number {
-  if (a === b) return 1;
-  if (a.length < 2 || b.length < 2) return 0;
+// ---------------------------------------------------------------------------
+// UK outward postcode (first half: "LS1", "M1", "EC1A")
+// ---------------------------------------------------------------------------
 
-  const bigramsA = bigrams(a);
-  const bigramsB = bigrams(b);
-  let intersect = 0;
-  for (const bg of bigramsA) {
-    if (bigramsB.has(bg)) intersect++;
-  }
-  return (2 * intersect) / (bigramsA.size + bigramsB.size);
+export function extractOutwardPostcode(input: string | null | undefined): string | null {
+  if (!input) return null;
+  const m = input.toUpperCase().match(/\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s*\d[A-Z]{2}\b/);
+  if (m) return m[1];
+  const o = input.toUpperCase().match(/^([A-Z]{1,2}\d{1,2}[A-Z]?)$/);
+  return o ? o[1] : null;
 }
 
-// Threshold: 0.75+ means very likely the same business
-const SIMILARITY_THRESHOLD = parseFloat(process.env.DEDUP_SIMILARITY_THRESHOLD ?? "0.75");
+// ---------------------------------------------------------------------------
+// Email normalisation — bulletproof
+//
+// Two emails are "the same inbox" if they normalise to the same string.
+//   - lowercase, trim
+//   - strip plus-tag (foo+anything@x.com → foo@x.com)
+//   - gmail.com / googlemail.com: strip dots in local part, treat googlemail
+//     as gmail
+//   - reject anything that isn't a syntactically valid address
+//
+// We deliberately do NOT compare just by domain — info@example.com vs
+// hello@example.com are different inboxes (and may even be different people).
+// We compare by full normalised inbox.
+// ---------------------------------------------------------------------------
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function normalizeEmail(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim().toLowerCase();
+  if (!EMAIL_REGEX.test(trimmed)) return null;
+
+  const [localRaw, domainRaw] = trimmed.split("@");
+  if (!localRaw || !domainRaw) return null;
+
+  // Strip plus-addressing universally (Gmail, Outlook 365, FastMail, ProtonMail all support it).
+  let local = localRaw.split("+")[0];
+
+  // Gmail-specific: dots in the local part are ignored, googlemail.com == gmail.com
+  let domain = domainRaw;
+  if (domain === "googlemail.com") domain = "gmail.com";
+  if (domain === "gmail.com") {
+    local = local.replace(/\./g, "");
+  }
+
+  if (!local) return null;
+  return `${local}@${domain}`;
+}
 
 // ---------------------------------------------------------------------------
-// Main Dedup Check
+// Dedup result type
 // ---------------------------------------------------------------------------
+
+export type DedupMatchType =
+  | "companies_house_number"
+  | "domain"
+  | "email"
+  | "phone"
+  | "exact_name"
+  | "name_postcode"
+  | "fuzzy_trigram";
 
 export interface DedupResult {
   isDuplicate: boolean;
   matchedLeadId: string | null;
-  matchType: "domain" | "exact_name" | "fuzzy_name" | null;
+  matchType: DedupMatchType | null;
   matchedBusinessName: string | null;
   similarity: number | null;
 }
 
-export async function checkDuplicate(opts: {
+export interface DedupInput {
   businessName: string;
   website?: string | null;
   city?: string | null;
-}): Promise<DedupResult> {
+  phone?: string | null;
+  email?: string | null;
+  address?: string | null;
+  outwardPostcode?: string | null;
+  companiesHouseNumber?: string | null;
+  /** When dedup-ing an enrichment update for an existing lead, exclude that
+   * lead's own id from the matchers — otherwise it always matches itself. */
+  excludeLeadId?: string | null;
+}
+
+const SIMILARITY_THRESHOLD = parseFloat(process.env.DEDUP_SIMILARITY_THRESHOLD ?? "0.7");
+const TRIGRAM_LIMIT = parseInt(process.env.DEDUP_TRIGRAM_LIMIT ?? "50", 10);
+
+// ---------------------------------------------------------------------------
+// Main check — layered, strongest signal first
+// ---------------------------------------------------------------------------
+
+export async function checkDuplicate(opts: DedupInput): Promise<DedupResult> {
   const normName = normalizeBusinessName(opts.businessName);
   const domain = extractDomain(opts.website);
+  const phoneE164 = normalizePhoneE164(opts.phone);
+  const emailNorm = normalizeEmail(opts.email);
+  const outwardPostcode =
+    opts.outwardPostcode ?? extractOutwardPostcode(opts.address ?? null);
+  const chNumber = opts.companiesHouseNumber?.replace(/\s/g, "").toUpperCase() || null;
+  const exclude = opts.excludeLeadId
+    ? { id: { not: opts.excludeLeadId } }
+    : {};
 
-  // ── Layer 1: Domain match (strongest signal) ──
-  if (domain) {
-    const domainMatch = await prisma.lead.findFirst({
-      where: { websiteDomain: domain },
+  // ── L1: Companies House number — definitive ───────────────────────────
+  if (chNumber) {
+    const m = await prisma.lead.findFirst({
+      where: { companiesHouseNumber: chNumber, ...exclude },
       select: { id: true, businessName: true },
     });
-    if (domainMatch) {
-      return {
-        isDuplicate: true,
-        matchedLeadId: domainMatch.id,
-        matchType: "domain",
-        matchedBusinessName: domainMatch.businessName,
-        similarity: 1,
-      };
-    }
+    if (m) return hit(m.id, m.businessName, "companies_house_number", 1);
   }
 
-  // ── Layer 2: Exact normalized name match ──
-  const exactMatch = await prisma.lead.findFirst({
-    where: { normalizedName: normName },
-    select: { id: true, businessName: true },
-  });
-  if (exactMatch) {
-    return {
-      isDuplicate: true,
-      matchedLeadId: exactMatch.id,
-      matchType: "exact_name",
-      matchedBusinessName: exactMatch.businessName,
-      similarity: 1,
-    };
-  }
-
-  // ── Layer 3: Fuzzy name match within same city (or globally if no city) ──
-  // Pull candidates with similar short normalized names to limit comparison set
-  // We use a prefix search (first 3 chars) to narrow the field, then Dice on each
-  const prefix = normName.slice(0, 3);
-  if (prefix.length >= 2) {
-    const candidates = await prisma.lead.findMany({
+  // ── L2: Email — definitive (same inbox cannot belong to two SMEs) ─────
+  // Case-insensitive equality so legacy rows stored with mixed-case emails
+  // still collide against the canonical lower-cased form we produce now.
+  if (emailNorm) {
+    const m = await prisma.lead.findFirst({
       where: {
-        normalizedName: { startsWith: prefix },
-        ...(opts.city ? { city: opts.city } : {}),
+        email: { equals: emailNorm, mode: "insensitive" },
+        ...exclude,
       },
-      select: { id: true, businessName: true, normalizedName: true },
-      take: 100,
+      select: { id: true, businessName: true },
     });
-
-    for (const candidate of candidates) {
-      if (!candidate.normalizedName) continue;
-      const sim = diceCoefficient(normName, candidate.normalizedName);
-      if (sim >= SIMILARITY_THRESHOLD) {
-        return {
-          isDuplicate: true,
-          matchedLeadId: candidate.id,
-          matchType: "fuzzy_name",
-          matchedBusinessName: candidate.businessName,
-          similarity: sim,
-        };
-      }
-    }
+    if (m) return hit(m.id, m.businessName, "email", 1);
   }
 
-  // Also check without prefix constraint but with city, for names that start differently
-  // e.g. "The Iron Temple" (normalized: "iron temple") vs "Temple Iron" (normalized: "temple iron")
-  if (opts.city && normName.length >= 4) {
-    const cityMatches = await prisma.lead.findMany({
-      where: {
-        city: opts.city,
-        normalizedName: { not: null },
-      },
-      select: { id: true, businessName: true, normalizedName: true },
-      take: 200,
+  // ── L3: Registered domain root — very strong ─────────────────────────
+  if (domain) {
+    const m = await prisma.lead.findFirst({
+      where: { websiteDomain: domain, ...exclude },
+      select: { id: true, businessName: true },
     });
+    if (m) return hit(m.id, m.businessName, "domain", 1);
+  }
 
-    for (const candidate of cityMatches) {
-      if (!candidate.normalizedName) continue;
-      const sim = diceCoefficient(normName, candidate.normalizedName);
-      if (sim >= SIMILARITY_THRESHOLD) {
-        return {
-          isDuplicate: true,
-          matchedLeadId: candidate.id,
-          matchType: "fuzzy_name",
-          matchedBusinessName: candidate.businessName,
-          similarity: sim,
-        };
-      }
-    }
+  // ── L4: E.164 phone — very strong (typo-resistant) ────────────────────
+  if (phoneE164) {
+    const m = await prisma.lead.findFirst({
+      where: { phoneE164, ...exclude },
+      select: { id: true, businessName: true },
+    });
+    if (m) return hit(m.id, m.businessName, "phone", 1);
+  }
+
+  // ── L5: Exact normalised name match ───────────────────────────────────
+  if (normName.length >= 2) {
+    const m = await prisma.lead.findFirst({
+      where: { normalizedName: normName, ...exclude },
+      select: { id: true, businessName: true },
+    });
+    if (m) return hit(m.id, m.businessName, "exact_name", 1);
+  }
+
+  // ── L6: Name + outward postcode (handles word reordering) ─────────────
+  if (outwardPostcode && normName.length >= 3) {
+    const fuzzy = await trigramFuzzyMatch(normName, { outwardPostcode }, opts.excludeLeadId ?? null);
+    if (fuzzy) return fuzzy;
+  }
+
+  // ── L7: Trigram fuzzy match (city-bounded if available) ───────────────
+  if (normName.length >= 4) {
+    const fuzzy = await trigramFuzzyMatch(normName, { city: opts.city ?? null }, opts.excludeLeadId ?? null);
+    if (fuzzy) return fuzzy;
   }
 
   return {
@@ -198,5 +270,81 @@ export async function checkDuplicate(opts: {
     matchType: null,
     matchedBusinessName: null,
     similarity: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Trigram fuzzy match — Postgres pg_trgm via raw query
+//
+// Requires the GIN index from the migration (idx_lead_normalized_name_trgm).
+// ---------------------------------------------------------------------------
+
+interface FuzzyScope {
+  outwardPostcode?: string | null;
+  city?: string | null;
+}
+
+async function trigramFuzzyMatch(
+  normName: string,
+  scope: FuzzyScope,
+  excludeLeadId: string | null,
+): Promise<DedupResult | null> {
+  const conditions: string[] = [`"normalizedName" IS NOT NULL`];
+  const params: unknown[] = [normName, normName, SIMILARITY_THRESHOLD, TRIGRAM_LIMIT];
+
+  if (scope.outwardPostcode) {
+    conditions.push(`"outwardPostcode" = $${params.length + 1}`);
+    params.push(scope.outwardPostcode);
+  } else if (scope.city) {
+    conditions.push(`"city" = $${params.length + 1}`);
+    params.push(scope.city);
+  }
+
+  if (excludeLeadId) {
+    conditions.push(`"id" <> $${params.length + 1}::uuid`);
+    params.push(excludeLeadId);
+  }
+
+  const where = conditions.join(" AND ");
+
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{ id: string; businessName: string; similarity: number }>
+  >(
+    `
+    SELECT id,
+           "businessName",
+           similarity("normalizedName", $1) AS similarity
+      FROM "Lead"
+     WHERE ${where}
+       AND similarity("normalizedName", $2) >= $3
+     ORDER BY similarity DESC
+     LIMIT $4
+    `,
+    ...params
+  );
+
+  if (rows.length === 0) return null;
+  const best = rows[0];
+  return {
+    isDuplicate: true,
+    matchedLeadId: best.id,
+    matchType: scope.outwardPostcode ? "name_postcode" : "fuzzy_trigram",
+    matchedBusinessName: best.businessName,
+    similarity: Number(best.similarity),
+  };
+}
+
+function hit(
+  id: string,
+  name: string,
+  type: DedupMatchType,
+  similarity: number
+): DedupResult {
+  return {
+    isDuplicate: true,
+    matchedLeadId: id,
+    matchType: type,
+    matchedBusinessName: name,
+    similarity,
   };
 }

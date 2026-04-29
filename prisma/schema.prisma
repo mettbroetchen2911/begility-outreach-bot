@@ -6,7 +6,7 @@ datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
-} 
+}
 
 enum LeadStatus {
   new_lead
@@ -34,6 +34,8 @@ enum Tier {
 
 enum DiscoverySource {
   google_maps
+  google_places
+  companies_house
   linkedin
   job_board
   manual
@@ -53,76 +55,87 @@ enum FollowUpStatus {
 }
 
 model Lead {
-  id                  String   @id @default(uuid()) @db.Uuid
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  status              LeadStatus @default(new_lead)
-  enrichmentLock      Boolean    @default(false)
+  status         LeadStatus @default(new_lead)
+  enrichmentLock Boolean    @default(false)
 
-  discoverySource     DiscoverySource @default(manual)
-  discoveryQuery      String?
-  discoveryRunId      String?         @db.Uuid
-  googlePlaceId       String?         @unique
+  discoverySource DiscoverySource @default(manual)
+  discoveryQuery  String?
+  discoveryRunId  String?         @db.Uuid
+  googlePlaceId   String?         @unique
 
-  businessName        String
-  normalizedName      String?
-  websiteDomain       String?
-  city                String?
-  country             String?
-  address             String?
-  googleRating        Float?
-  websiteUrl          String?
-  geminiResearchJson  Json?
-  ownerName           String?
-  website             String?
-  email               String?
-  phone               String?
-  linkedin            String?
-  instagram           String?
-  sector              String?
+  businessName   String
+  normalizedName String?
+  websiteDomain  String?
+  city           String?
+  country        String?
+  address        String?
+  googleRating   Float?
+  websiteUrl     String?
+
+  // ── Companies House identity ──
+  companiesHouseNumber String?   @unique
+  sicCodes             String[]
+  accountsCategory     String?
+  incorporatedOn       DateTime?
+  companyStatus        String?
+
+  // ── Stronger dedup signals ──
+  phoneE164             String?
+  outwardPostcode       String?
+  geminiResearchJson    Json?
+  ownerName             String?
+  website               String?
+  email                 String?
+  phone                 String?
+  linkedin              String?
+  instagram             String?
+  sector                String?
   employeeCountEstimate String?
-  techStackSignals    String[]
-  operationalSignals  String[]
-  businessDescription String?  @db.Text
-  searchConfidence    Int?
+  techStackSignals      String[]
+  operationalSignals    String[]
+  businessDescription   String?  @db.Text
+  searchConfidence      Int?
 
-  emailVerified       Boolean   @default(false)
-  emailVerifiedAt     DateTime?
-  mxValid             Boolean?
-  smtpValid           Boolean?
-  isCatchAll          Boolean?
-  verificationScore   Int?
+  emailVerified     Boolean   @default(false)
+  emailVerifiedAt   DateTime?
+  mxValid           Boolean?
+  smtpValid         Boolean?
+  isCatchAll        Boolean?
+  verificationScore Int?
 
-  brandFitScore       Int?
-  brandFitRationale   String?  @db.Text
+  brandFitScore         Int?
+  brandFitRationale     String? @db.Text
   primaryPainHypothesis String? @db.Text
-  suggestedLane       String?
-  tier                Tier?
-  draftSubject        String?
-  draftBodyHtml       String?  @db.Text
-  outlookDraftId      String?
+  suggestedLane         String?
+  tier                  Tier?
+  draftSubject          String?
+  draftBodyHtml         String? @db.Text
+  outlookDraftId        String?
 
-  draftCreatedAt      DateTime?
-  lastContactedAt     DateTime?
-  sentBy              String?
-  replyReceived       Boolean   @default(false)
-  replyBody           String?   @db.Text
-  replySentiment      String?
-  replyReasoning      String?   @db.Text
-  lastReplyAt         DateTime?
+  draftCreatedAt  DateTime?
+  lastContactedAt DateTime?
+  sentBy          String?
+  replyReceived   Boolean   @default(false)
+  replyBody       String?   @db.Text
+  replySentiment  String?
+  replyReasoning  String?   @db.Text
+  lastReplyAt     DateTime?
 
-  followUpDraftId     String?
-  followUpQueuedAt    DateTime?
+  followUpDraftId  String?
+  followUpQueuedAt DateTime?
 
   teamsCardActivityId String?
 
-  conversationId      String?  @db.Text
+  conversationId String? @db.Text
 
-  notes               String?  @db.Text
+  notes String? @db.Text
 
-  suppressions        Suppression[]
-  followUpQueue       FollowUpQueue[]
+  suppressions  Suppression[]
+  followUpQueue FollowUpQueue[]
 
   @@index([status, discoverySource])
   @@index([status, enrichmentLock])
@@ -132,6 +145,8 @@ model Lead {
   @@index([normalizedName])
   @@index([websiteDomain])
   @@index([conversationId])
+  @@index([phoneE164])
+  @@index([outwardPostcode])
 }
 
 model Suppression {
@@ -146,44 +161,44 @@ model Suppression {
 }
 
 model FollowUpQueue {
-  id              String         @id @default(uuid()) @db.Uuid
-  queuedAt        DateTime       @default(now())
+  id       String   @id @default(uuid()) @db.Uuid
+  queuedAt DateTime @default(now())
 
-  leadId          String         @db.Uuid
-  lead            Lead           @relation(fields: [leadId], references: [id])
+  leadId String @db.Uuid
+  lead   Lead   @relation(fields: [leadId], references: [id])
 
   businessName    String
   email           String
   draftId         String?
-  draftPreview    String?        @db.Text
-  geminiReasoning String         @db.Text
+  draftPreview    String? @db.Text
+  geminiReasoning String  @db.Text
 
-  status          FollowUpStatus @default(pending)
-  approvedBy      String?
-  approvedAt      DateTime?
+  status     FollowUpStatus @default(pending)
+  approvedBy String?
+  approvedAt DateTime?
 
   @@index([status])
   @@index([leadId])
 }
 
 model ErrorLog {
-  id              String   @id @default(uuid()) @db.Uuid
-  timestamp       DateTime @default(now())
+  id        String   @id @default(uuid()) @db.Uuid
+  timestamp DateTime @default(now())
 
   scenarioName    String
   moduleName      String?
   errorCode       String
-  errorMessage    String   @db.Text
-  leadId          String?  @db.Uuid
-  killSwitchFired Boolean  @default(false)
+  errorMessage    String  @db.Text
+  leadId          String? @db.Uuid
+  killSwitchFired Boolean @default(false)
 
   @@index([errorCode, timestamp])
   @@index([timestamp])
 }
 
 model DiscoveryRun {
-  id            String          @id @default(uuid()) @db.Uuid
-  ranAt         DateTime        @default(now())
+  id    String   @id @default(uuid()) @db.Uuid
+  ranAt DateTime @default(now())
 
   source        DiscoverySource
   query         String
@@ -201,8 +216,8 @@ model BotConversationRef {
   id                    String   @id @default(uuid()) @db.Uuid
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
-  channelType           String   @unique 
-  conversationReference Json                
+  channelType           String   @unique
+  conversationReference Json
 }
 
 model RuntimeConfig {
@@ -217,15 +232,24 @@ model RuntimeConfig {
 }
 
 model ScrapeCache {
-  domain        String   @id
+  domain       String   @id
+  payload      Json
+  fetchedAt    DateTime @default(now())
+  expiresAt    DateTime
+  pagesScraped Int      @default(0)
+  confidence   String?
+
+  @@index([expiresAt])
+}
+
+model CompaniesHouseCache {
+  companyNumber String   @id
   payload       Json
   fetchedAt     DateTime @default(now())
   expiresAt     DateTime
-  pagesScraped  Int      @default(0)
-  confidence    String?
 
-   @@index([expiresAt])
- }
+  @@index([expiresAt])
+}
 
 model GraphSubscription {
   id                 String    @id @default(uuid()) @db.Uuid

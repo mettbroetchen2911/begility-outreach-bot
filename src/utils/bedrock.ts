@@ -21,8 +21,15 @@ function client(): BedrockRuntimeClient {
   const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "us-east-1";
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+  const requireExplicit = (process.env.BEDROCK_REQUIRE_EXPLICIT_CREDS ?? "false").toLowerCase() === "true";
 
-  // Allow IAM role / instance-profile auth by not forcing keys when absent
+  if (requireExplicit && (!accessKeyId || !secretAccessKey)) {
+    throw new Error(
+      "BEDROCK_REQUIRE_EXPLICIT_CREDS=true but AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set. " +
+      "Either set both, or set BEDROCK_REQUIRE_EXPLICIT_CREDS=false to allow ambient AWS auth (IAM role / shared config)."
+    );
+  }
+
   cachedClient = new BedrockRuntimeClient({
     region,
     ...(accessKeyId && secretAccessKey
@@ -30,6 +37,47 @@ function client(): BedrockRuntimeClient {
       : {}),
   });
   return cachedClient;
+}
+
+/**
+ * Boot-time smoke test. Calls Sonnet with a 1-token prompt to verify creds,
+ * region, model access, and IAM permissions. Throws on any failure so the
+ * service refuses to serve traffic with broken Bedrock auth.
+ */
+export async function preflightBedrock(): Promise<void> {
+  const modelId =
+    process.env.BEDROCK_SONNET_MODEL_ID ??
+    "anthropic.claude-sonnet-4-5-20250929-v1:0";
+  const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "us-east-1";
+
+  try {
+    const cmd = new InvokeModelCommand({
+      modelId,
+      contentType: "application/json",
+      accept: "application/json",
+      body: Buffer.from(
+        JSON.stringify({
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 4,
+          messages: [{ role: "user", content: [{ type: "text", text: "ping" }] }],
+        })
+      ),
+    });
+    await client().send(cmd);
+    console.log(`[bedrock] Preflight OK — region=${region}, model=${modelId}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `[bedrock] Preflight FAILED.\n` +
+      `Region: ${region}\nModel: ${modelId}\n` +
+      `Underlying error: ${msg}\n\n` +
+      `Common causes:\n` +
+      `  1. AWS creds not set or invalid (check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)\n` +
+      `  2. Sonnet 4.5 not enabled in the chosen region (request access in Bedrock console → Model access)\n` +
+      `  3. IAM role missing bedrock:InvokeModel permission\n` +
+      `  4. Wrong region — Sonnet 4.5 is available in us-east-1, us-west-2, eu-central-1, etc.`
+    );
+  }
 }
 
 export interface BedrockClaudeOptions {

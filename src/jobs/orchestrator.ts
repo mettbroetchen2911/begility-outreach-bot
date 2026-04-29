@@ -5,6 +5,7 @@ import { AIService } from "../services/ai.service.js";
 import { getNicheConfig } from "../config/niche.js";
 import { logError } from "../utils/logger.js";
 import { verifyEmail } from "../verification/email-verifier.js";
+import { checkDuplicate, normalizeEmail, normalizePhoneE164 } from "../utils/dedup.js";
 import { scrapeBusinessWebsiteV2 } from "../services/website-scraper-v2.js";
 import { draftOutreachEmail } from "../services/outreach-drafter.js";
 import { getConfig } from "../services/runtime-config.service.js";
@@ -63,20 +64,26 @@ for (const lead of leads) {
       console.log("  [1/7] Researching...");
       const research = await ai.runResearch(lead.businessName, lead.city ?? "");
 
+      // Normalise contact signals before persistence so downstream dedup &
+      // suppression queries see the same canonical form.
+      const emailNormalized = normalizeEmail(research.email ?? lead.email);
+      const phoneE164 = normalizePhoneE164(research.phone ?? lead.phone);
+
       await prisma.lead.update({
         where: { id: lead.id },
         data: {
           geminiResearchJson: research as any,
           ownerName: research.owner_name ?? lead.ownerName,
-          email: research.email ?? lead.email,
+          email: emailNormalized,
           phone: research.phone ?? lead.phone,
-          instagram: (research as any).instagram ?? lead.instagram, // <-- Added (research as any)
+          phoneE164,
+          instagram: (research as any).instagram ?? lead.instagram,
           websiteUrl: research.website ?? lead.websiteUrl,
           businessDescription: research.description ?? lead.businessDescription,
         },
       });
 
-      if (!research.email) {
+      if (!emailNormalized) {
         console.log("  No email found — excluding.");
         await prisma.lead.update({
           where: { id: lead.id },
@@ -86,13 +93,52 @@ for (const lead of leads) {
         continue;
       }
 
+      // ── Post-research dedup ───────────────────────────────────────────
+      // The lead row was created at discovery with only name/address. Now
+      // that we have an email + phone + (maybe) website, run dedup again
+      // — excluding this lead's own id — to catch the case where the same
+      // business surfaced under two different names (e.g. trading name vs
+      // registered name) and they only collide on contact details.
+      const postResearchDedup = await checkDuplicate({
+        businessName: lead.businessName,
+        website: research.website ?? lead.websiteUrl,
+        city: lead.city,
+        phone: research.phone ?? lead.phone,
+        email: emailNormalized,
+        address: lead.address,
+        outwardPostcode: lead.outwardPostcode,
+        companiesHouseNumber: lead.companiesHouseNumber,
+        excludeLeadId: lead.id,
+      });
+      if (postResearchDedup.isDuplicate) {
+        console.log(
+          `  Duplicate of "${postResearchDedup.matchedBusinessName}" ` +
+          `via ${postResearchDedup.matchType} — excluding.`
+        );
+        await prisma.lead.update({
+          where: { id: lead.id },
+          data: {
+            status: "exclude",
+            enrichmentLock: false,
+            notes: `Duplicate of lead ${postResearchDedup.matchedLeadId} ` +
+              `(${postResearchDedup.matchType}, sim=${postResearchDedup.similarity?.toFixed(2) ?? "1.00"})`,
+          },
+        });
+        results.push({
+          leadId: lead.id,
+          businessName: lead.businessName,
+          outcome: `duplicate_${postResearchDedup.matchType}`,
+        });
+        continue;
+      }
+
       // =====================================================================
       // STEP 3: Email Verification
       // =====================================================================
       console.log("  [2/7] Verifying email...");
       await prisma.lead.update({ where: { id: lead.id }, data: { status: "verifying" } });
 
-      const verification = await verifyEmail(research.email);
+      const verification = await verifyEmail(emailNormalized);
       const threshold = verificationThreshold;
 
       await prisma.lead.update({
@@ -183,7 +229,7 @@ await prisma.lead.update({
 
       if (tier === "Tier1") {
         // Create Outlook draft
-        const outlookDraft = await email.createDraft(research.email, draft.subject_line, draft.email_body_html);
+        const outlookDraft = await email.createDraft(emailNormalized, draft.subject_line, draft.email_body_html);
 
         // Send editable approval card via bot
         const fullLead = await prisma.lead.findUnique({ where: { id: lead.id } });
@@ -209,7 +255,7 @@ await prisma.lead.update({
 
       } else if (tier === "Tier2") {
         // ── NEW: Tier 2 now also gets an approval card in Teams ──
-        const outlookDraft = await email.createDraft(research.email, draft.subject_line, draft.email_body_html);
+        const outlookDraft = await email.createDraft(emailNormalized, draft.subject_line, draft.email_body_html);
 
         const fullLead = await prisma.lead.findUnique({ where: { id: lead.id } });
         let activityId: string | null = null;

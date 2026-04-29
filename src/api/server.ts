@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
 import { prisma } from "../utils/prisma.js";
 import { apiKeyGuard } from "../middleware/auth.js";
+import { preflightBedrock } from "../utils/bedrock.js";
 
 // Routers
 import botMessagesRouter from "./bot-messages.js";
@@ -147,22 +148,38 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 
 // ── Start ──
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
-const server = app.listen(PORT, () => {
-  console.log(`Lead Engine on :${PORT} (${process.env.NODE_ENV ?? "dev"})`);
 
-  // Bootstrap the Graph sent-items subscription on boot if configured.
-  // No-op if the existing sub still has enough headroom.
-  if (process.env.GRAPH_NOTIFY_URL && process.env.GRAPH_CLIENT_STATE_SECRET) {
-    ensureGraphSubscription()
-      .then((r) => console.log(`[graph-sub] bootstrap: ${r.action} ${r.subscriptionId}${r.reason ? " (" + r.reason + ")" : ""}`))
-      .catch((e) => console.error(`[graph-sub] bootstrap failed: ${e instanceof Error ? e.message : String(e)}`));
-  }
+let server: ReturnType<typeof app.listen>;
+
+async function bootstrap() {
+  await preflightBedrock();
+
+  server = app.listen(PORT, () => {
+    console.log(`Lead Engine on :${PORT} (${process.env.NODE_ENV ?? "dev"})`);
+
+    // Bootstrap the Graph sent-items subscription on boot if configured.
+    // No-op if the existing sub still has enough headroom.
+    if (process.env.GRAPH_NOTIFY_URL && process.env.GRAPH_CLIENT_STATE_SECRET) {
+      ensureGraphSubscription()
+        .then((r) => console.log(`[graph-sub] bootstrap: ${r.action} ${r.subscriptionId}${r.reason ? " (" + r.reason + ")" : ""}`))
+        .catch((e) => console.error(`[graph-sub] bootstrap failed: ${e instanceof Error ? e.message : String(e)}`));
+    }
+  });
+}
+
+bootstrap().catch((err) => {
+  console.error("Bootstrap failed:", err);
+  process.exit(1);
 });
 
 // ── Graceful shutdown (Cloud Run sends SIGTERM) ──
 function shutdown(sig: string) {
   console.log(`${sig} — draining…`);
-  server.close(async () => { await prisma.$disconnect(); process.exit(0); });
+  if (server) {
+    server.close(async () => { await prisma.$disconnect(); process.exit(0); });
+  } else {
+    prisma.$disconnect().finally(() => process.exit(0));
+  }
   setTimeout(() => process.exit(1), 10_000);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
