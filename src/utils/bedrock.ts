@@ -18,7 +18,7 @@ let cachedClient: BedrockRuntimeClient | null = null;
 function client(): BedrockRuntimeClient {
   if (cachedClient) return cachedClient;
 
-  const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "us-east-1";
+  const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "eu-west-2";
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
   const requireExplicit = (process.env.BEDROCK_REQUIRE_EXPLICIT_CREDS ?? "false").toLowerCase() === "true";
@@ -48,7 +48,7 @@ export async function preflightBedrock(): Promise<void> {
   const modelId =
     process.env.BEDROCK_SONNET_MODEL_ID ??
     "anthropic.claude-sonnet-4-5-20250929-v1:0";
-  const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "us-east-1";
+  const region = process.env.AWS_BEDROCK_REGION ?? process.env.AWS_REGION ?? "eu-west-2";
 
   try {
     const cmd = new InvokeModelCommand({
