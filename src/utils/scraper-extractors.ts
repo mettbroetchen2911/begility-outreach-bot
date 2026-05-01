@@ -52,14 +52,17 @@ export function extractFromHtml(html: string, baseUrl: string): RawExtract {
   };
 
   // ── Emails (mailto + inline) ──
+  // Filter only obvious image-extension false positives at the regex layer.
+  // Content-based filtering (placeholders, third-party services, template
+  // text) is delegated to the Gemini email picker — it sees the surrounding
+  // context and is far better at it than a hardcoded substring blacklist.
   const emailRe = /(?:mailto:)?([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/gi;
   const emailHits = new Set<string>();
   let m: RegExpExecArray | null;
   while ((m = emailRe.exec(html)) !== null) {
     const addr = m[1].toLowerCase();
     if (!addr.includes("@")) continue;
-    if (addr.endsWith(".png") || addr.endsWith(".jpg") || addr.endsWith(".webp")) continue;
-    if (addr.includes("sentry") || addr.includes("example.com") || addr.includes("wixpress")) continue;
+    if (addr.endsWith(".png") || addr.endsWith(".jpg") || addr.endsWith(".webp") || addr.endsWith(".gif") || addr.endsWith(".svg")) continue;
     emailHits.add(addr);
   }
   out.emails = rankEmails([...emailHits]);

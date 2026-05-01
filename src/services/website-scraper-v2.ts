@@ -140,11 +140,30 @@ export async function scrapeBusinessWebsiteV2(
     deterministic: merged,
   });
 
+  // ── Email validation: cross-check Gemini's pick against the regex
+  // candidate set. Gemini's prompt instructs it to pick from emails_found,
+  // so anything outside that set is a hallucination. A null pick is also
+  // legitimate — it means every candidate was a placeholder / third-party
+  // address and we should record no email rather than spam a bad one. ──
+  const candidateSet = new Set(merged.emails.map((e) => e.toLowerCase()));
+  const geminiPick = geminiFill.email ? geminiFill.email.toLowerCase() : null;
+  let validatedEmail: string | null = null;
+  if (geminiPick && candidateSet.has(geminiPick)) {
+    validatedEmail = geminiPick;
+    if (geminiPick !== merged.emails[0]) {
+      console.log(`[ScraperV2] Gemini chose '${geminiPick}' over regex first-match '${merged.emails[0]}'`);
+    }
+  } else if (geminiPick) {
+    console.warn(`[ScraperV2] Gemini suggested '${geminiPick}' which wasn't in regex candidates — rejecting (possible hallucination)`);
+  } else if (merged.emails.length > 0) {
+    console.log(`[ScraperV2] Gemini returned null email — all candidates (${merged.emails.join(", ")}) rejected as placeholders/third-party`);
+  }
+
   // ── Final assembly — prefer deterministic over LLM for factual fields ──
   const final: ScrapedDataV2 = {
     owner_name: pickOwner(merged, geminiFill),
-    email: merged.emails[0] ?? geminiFill.email ?? null,
-    alternate_emails: merged.emails.slice(1, 5),
+    email: validatedEmail,
+    alternate_emails: merged.emails.filter((e) => e !== validatedEmail).slice(0, 4),
     phone: merged.phonesRaw[0] ?? geminiFill.phone ?? null,
     phone_e164: merged.phonesE164[0] ?? (geminiFill.phone ? toE164(geminiFill.phone, normalised) : null),
     instagram: normaliseInstagramHandle(merged.instagramHandles[0] ?? geminiFill.instagram),
@@ -351,6 +370,7 @@ function mergeExtracts(extracts: RawExtract[]): RawExtract {
 interface GeminiFill {
   owner_name: string | null;
   email: string | null;
+  email_evidence: string | null;
   phone: string | null;
   instagram: string | null;
   description: string | null;
@@ -391,19 +411,29 @@ async function geminiGapFill(opts: {
 
 Business: "${opts.businessName}"${opts.city ? ` (${opts.city})` : ""}
 
-DATA ALREADY EXTRACTED BY REGEX/JSON-LD (trust these — do not re-extract or contradict):
+DATA ALREADY EXTRACTED BY REGEX/JSON-LD:
 ${JSON.stringify(detSummary, null, 2)}
+
+The 'emails_found' list is RAW REGEX OUTPUT — it includes any string that looks
+like an email, which means it can contain template placeholders (sample@mail.com,
+your@email.com, name@company.com), third-party tools (notifications@stripe.com,
+support@shopify.com, hello@mailchimp.com), tracking pixels, and unrelated
+addresses that happen to appear in the page source. Your job is to pick the
+ONE address that is genuinely the business's own contact email — or return
+null if none of them are.
 
 SCRAPED WEBSITE CONTENT:
 ${opts.combinedText}
 
-Your job is to fill the gaps and write a rich description. Be precise. Never fabricate.
-
 Return a single JSON object:
 
 {
-  "owner_name": "Full name of the owner/founder/head decision-maker. Cross-reference the 'people_heuristic' list — if one clearly looks like the owner (role includes Founder, Owner, CEO, Director), return that. Otherwise null.",
-  "email": "Pick the single best personal email from emails_found. Prefer first.last@ over info@. null if only generic addresses found.",
+  "owner_name": "Full name of the owner/founder/head decision-maker. Cross-reference the 'people_heuristic' list — if one clearly looks like the owner (role includes Founder, Owner, CEO, Managing Director, Director, Partner), return that. Otherwise null.",
+
+  "email": "Pick the single real business contact email from emails_found. RULES: (1) REJECT template placeholders — anything that looks like demo content (sample@, example@, your@, you@, name@, test@, demo@, email@, hello@example.*, @yourdomain.*, @mysite.*). These appear in newsletter signup forms, contact form previews, and unedited template text. (2) REJECT third-party service emails — anything from stripe, shopify, mailchimp, klaviyo, sentry, intercom, hubspot, wix, squarespace, godaddy, etc. (3) PREFER an email that appears in a 'Contact', 'Get in touch', 'About', 'Team', or footer context — those are the business's own. (4) PREFER personal addresses (first.last@ or firstname@) over generic info@/hello@/contact@/enquiries@ on the same domain — for B2B SME outreach a named decision-maker inbox is far higher value than a shared one. (5) ACCEPT free-mail addresses (gmail, hotmail, outlook, btinternet etc.) ONLY if the page text indicates this is the owner's business inbox — small UK SMEs legitimately use personal Hotmail/Gmail as their business contact, and these often appear in the footer next to a phone number and address. (6) If NONE of the candidates pass these tests, return null. A null email is correct when the only candidates are placeholders or third-party services.",
+
+  "email_evidence": "Brief quote (max 100 chars) of the surrounding page text where the chosen email appears, e.g. 'Email: jdoe@acme.co.uk Phone: 0207 2894551'. null if email is null. This is so a human reviewer can audit the decision.",
+
   "phone": "Primary phone. null if none.",
   "instagram": "Primary Instagram handle (no @). null if none.",
   "description": "3-4 sentences: what the business does, who they serve, and how they operate. Ground this in the website content — mention concrete specifics (sectors, geographies, service lines).",
@@ -411,7 +441,7 @@ Return a single JSON object:
   "clientele": "1 sentence: who their customers are — sector, size, geography, typical use case.",
   "services": ["array of concrete service lines, product categories, or capabilities offered"],
   "location": "City, country.",
-  "confidence": "high | medium | low — based on how much verifiable detail you found."
+  "confidence": "high | medium | low — based on how much verifiable detail you found. If you returned a non-null email and you can quote evidence for it, that's high confidence on contact data."
 }
 
 Return ONLY the JSON object.`,
@@ -429,6 +459,7 @@ Return ONLY the JSON object.`,
       return {
         owner_name: typeof parsed.owner_name === "string" ? parsed.owner_name : null,
         email: typeof parsed.email === "string" ? parsed.email : null,
+        email_evidence: typeof parsed.email_evidence === "string" ? parsed.email_evidence : null,
         phone: typeof parsed.phone === "string" ? parsed.phone : null,
         instagram: typeof parsed.instagram === "string" ? parsed.instagram : null,
         description: typeof parsed.description === "string" ? parsed.description : null,
@@ -442,7 +473,7 @@ Return ONLY the JSON object.`,
   } catch (err) {
     console.warn(`[ScraperV2] Gemini gap-fill failed, using extractors only: ${(err as Error).message}`);
     return {
-      owner_name: null, email: null, phone: null, instagram: null,
+      owner_name: null, email: null, email_evidence: null, phone: null, instagram: null,
       description: null, positioning: null, clientele: null, services: [],
       location: null, confidence: "low",
     };
@@ -474,13 +505,17 @@ function gradeConfidence(merged: RawExtract, fill: GeminiFill): "high" | "medium
 async function readCache(domain: string): Promise<ScrapedDataV2 | null> {
   const now = Date.now();
   const mem = memCache.get(domain);
-  if (mem && mem.expiresAt > now) return mem.data;
+  if (mem && mem.expiresAt > now) {
+    console.log(`[ScraperV2] Cache HIT (mem) ${domain} → email=${mem.data.email ?? 'NULL'} confidence=${mem.data.confidence}`);
+    return mem.data;
+  }
 
   try {
     const row = await (prisma as any).scrapeCache?.findUnique?.({ where: { domain } });
     if (!row) return null;
     if (new Date(row.expiresAt).getTime() < now) return null;
     const data = row.payload as ScrapedDataV2;
+    console.log(`[ScraperV2] Cache HIT (db) ${domain} → email=${data.email ?? 'NULL'} confidence=${data.confidence}`);
     memCache.set(domain, { data, expiresAt: new Date(row.expiresAt).getTime() });
     return data;
   } catch {
@@ -491,7 +526,14 @@ async function readCache(domain: string): Promise<ScrapedDataV2 | null> {
 async function writeCache(domain: string, data: ScrapedDataV2): Promise<void> {
   const hours = await getConfig<number>("SCRAPE_CACHE_HOURS").catch(() => 168);
   if (hours <= 0) return;
-  const expiresAt = new Date(Date.now() + hours * 3600 * 1000);
+
+  // Negative results get a much shorter TTL — a missed email shouldn't lock
+  // a lead out for a week. Sites change, the scraper improves, and the
+  // Gemini email picker is still maturing. Re-try sooner on misses.
+  const isLowValue = !data.email && data.confidence === "low";
+  const effectiveHours = isLowValue ? Math.min(hours, 24) : hours;
+
+  const expiresAt = new Date(Date.now() + effectiveHours * 3600 * 1000);
   memCache.set(domain, { data, expiresAt: expiresAt.getTime() });
   try {
     await (prisma as any).scrapeCache.upsert({

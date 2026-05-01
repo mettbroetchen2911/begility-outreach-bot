@@ -32,6 +32,13 @@ export interface DraftContext {
   scrape?: Partial<ScrapedDataV2> | null;
   /** Light-weight fallback when a v2 scrape isn't available. */
   researchJsonFallback?: unknown;
+  /** Authoritative CH/HMRC facts block — turnover, headcount, director,
+   * VAT, anniversaries. Grounds the email far better than scraped text. */
+  companyFactsBlock?: string | null;
+  /** If this lead was scheduled into a specific outreach window (e.g.
+   * "post-year-end", "new-director-honeymoon", "10-year-anniversary"),
+   * the drafter can lean into the timing as a credible warm hook. */
+  sendWindowReason?: string | null;
 }
 
 export interface DraftResult {
@@ -112,6 +119,10 @@ async function callClaude(
   const sourceLine = buildSourceLine(ctx);
   const scrapeCtx = buildScrapeContext(ctx);
   const laneGuidance = buildLaneGuidance(ctx);
+  const factsSection = ctx.companyFactsBlock
+    ? `\nAUTHORITATIVE COMPANIES HOUSE / HMRC FACTS (these come from filings, not website inference — they are the source of truth and override anything in the research data that contradicts them. Do NOT print them as bullet points or quote them verbatim — use them to ground a single specific reference in the email):\n${ctx.companyFactsBlock}\n`
+    : "";
+  const windowGuidance = buildWindowGuidance(ctx.sendWindowReason);
 
   const retryNote = opts.retryDirection
     ? `\n\nPREVIOUS ATTEMPT FEEDBACK: ${opts.retryDirection}. Rewrite the body accordingly — same structure, same ${opts.wordMin}-${opts.wordMax} word band.`
@@ -133,9 +144,10 @@ OPENING REQUIREMENTS:
 - "How I found you" sentence MUST reference: ${sourceLine}
 - Do NOT invent a different source — use the one above.
 
-BUSINESS RESEARCH:
+BUSINESS RESEARCH (from the website + Gemini search — may be incomplete):
 ${scrapeCtx}
-
+${factsSection}
+${windowGuidance}
 BEGILITY FIT RATIONALE (our internal analysis of why this business was selected — use this to ground the "why them" sentence, but do NOT quote it verbatim):
 ${ctx.rationale}
 
@@ -391,4 +403,34 @@ function getSenderDomain(): string {
   const raw = process.env.SENDER_EMAIL_DOMAIN ?? "";
   const cleaned = raw.replace(/^https?:\/\//i, "").replace(/\/$/, "").trim();
   return cleaned || "begility.com";
+}
+
+// ---------------------------------------------------------------------------
+// Send-window guidance — when the orchestrator schedules outreach into a
+// specific calendar window (post year-end, new-director honeymoon, 10-year
+// anniversary, etc), nudge the drafter to lean on the timing as a credible
+// warm hook. Subtle — never name "we waited until your year-end".
+// ---------------------------------------------------------------------------
+
+function buildWindowGuidance(reason: string | null | undefined): string {
+  if (!reason) return "";
+  switch (reason) {
+    case "new-director-honeymoon":
+      return "TIMING ANGLE: A new director was appointed in the last 90 days. New mandates are the most receptive moment to discuss operational change. The email may briefly note that fresh leadership is often the moment when operating habits get re-examined — but ONLY if it lands naturally. Never name this as a reason for emailing.\n";
+    case "post-year-end":
+      return "TIMING ANGLE: This business has just passed its financial year-end. Founders are typically deep in admin and looking at what last year actually cost. The email may briefly nod to that ('the period after year-end usually brings a clear-eyed look at where the time went') — only if it lands naturally.\n";
+    case "pre-accounts-deadline":
+      return "TIMING ANGLE: This business's accounts deadline is approaching. Same energy as post year-end — the founder is reviewing the year. Use lightly if at all.\n";
+    case "5-year-anniversary":
+    case "10-year-anniversary":
+    case "15-year-anniversary":
+    case "20-year-anniversary":
+    case "25-year-anniversary":
+    case "30-year-anniversary": {
+      const years = reason.split("-")[0];
+      return `TIMING ANGLE: This business is approaching ${years} years since incorporation. Anniversaries are a credible warm hook — a founder who has been running ${years} years will have heard every cold pitch in that time, and acknowledging the milestone (one short clause, no congratulations theatre) lands as humanity rather than a mail-merge.\n`;
+    }
+    default:
+      return "";
+  }
 }

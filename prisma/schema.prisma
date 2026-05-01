@@ -59,8 +59,13 @@ model Lead {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  status         LeadStatus @default(new_lead)
-  enrichmentLock Boolean    @default(false)
+  status             LeadStatus @default(new_lead)
+  enrichmentLock     Boolean    @default(false)
+  /**
+   * When the row was locked for enrichment. Used to expire stale locks
+   * left behind by crashed / killed orchestrator runs.
+   */
+  enrichmentLockedAt DateTime?
 
   discoverySource DiscoverySource @default(manual)
   discoveryQuery  String?
@@ -82,6 +87,79 @@ model Lead {
   accountsCategory     String?
   incorporatedOn       DateTime?
   companyStatus        String?
+
+  // ── Companies House richer signals ──
+  accountsLastMadeUpTo        DateTime?
+  accountsNextDue             DateTime?
+  confirmationNextDue         DateTime?
+  directorCount               Int?
+  /**
+   * Earliest officer appointment date — proxy for "founder still in" /
+   * stable leadership.
+   */
+  earliestDirectorAppointedOn DateTime?
+  /**
+   * Most recent officer appointment date — flag for "new MD" outreach.
+   */
+  latestDirectorAppointedOn   DateTime?
+  activeChargesCount          Int?
+  recentChargeCreatedOn       DateTime?
+  registeredOfficeMovedOn     DateTime?
+  pscCount                    Int?
+
+  // ── HMRC / VAT ──
+  vatNumber        String?
+  vatRegistered    Boolean?
+  vatEffectiveFrom DateTime?
+  vatCheckedAt     DateTime?
+
+  // ── Latest filed financials (parsed from iXBRL) ──
+  latestTurnover         BigInt?
+  latestEmployeeCount    Int?
+  priorYearTurnover      BigInt?
+  priorYearEmployeeCount Int?
+  turnoverGrowthPct      Float?
+  employeeGrowthPct      Float?
+  latestAccountsMadeUpTo DateTime?
+  latestProfitLoss       BigInt?
+
+  // ── CH composite pre-score (cheap, computed before scrape/Gemini) ──
+  chPreScore Int?
+  chSignals  String[]
+
+  // ── Rendered authoritative facts block — what the scorer + drafter read.
+  // Persisted so operators can audit what the model was actually told, and
+  // so the Teams approval card can display it without recomputing.
+  companyFactsBlock String? @db.Text
+
+  // ── Tier-5 noise / risk audit columns ──
+  // Last filed accounts type (e.g. "DORMANT", "AA02", "MICRO_ENTITY"). Used
+  // to detect dormant filers that pass the accounts-category gate but
+  // wouldn't actually buy operational change.
+  lastAccountsType String?
+  // True when the registered office matches a known nominee / formation-agent
+  // address. Such companies are pass-through registrations, not real trading
+  // premises — almost never our ICP.
+  nomineeAddress Boolean? @default(false)
+  // If we detected this company is a subsidiary of another lead in our DB
+  // (same registered office + ≥1 director overlap), point at the parent so
+  // the operator can decide whether to pitch the parent instead.
+  subsidiaryOfLeadId String? @db.Uuid
+  // Active corporate-entity PSCs (parent companies, holding co's). When
+  // dominant, the decision-maker isn't reachable on the first call.
+  corporatePscCount Int?
+  // Number of "change of name" filings in the last 5 years — high counts
+  // are a red flag for shell-company patterns and rebrand churn.
+  recentNameChangeCount Int?
+
+  // ── Send-window scheduling ──
+  // When this lead is allowed to be processed by the orchestrator. If null,
+  // processed immediately. If set in the future, the orchestrator skips it
+  // until the window opens. Computed by send-window-scheduler from year-end
+  // timing, accounts-due timing, anniversaries, and new-director events.
+  nextOutreachWindow       DateTime?
+  // Why we picked the window — surfaced in approval cards and used by drafter.
+  nextOutreachWindowReason String?
 
   // ── Stronger dedup signals ──
   phoneE164             String?
@@ -136,6 +214,7 @@ model Lead {
 
   suppressions  Suppression[]
   followUpQueue FollowUpQueue[]
+  officers      Officer[]
 
   @@index([status, discoverySource])
   @@index([status, enrichmentLock])
@@ -147,6 +226,8 @@ model Lead {
   @@index([conversationId])
   @@index([phoneE164])
   @@index([outwardPostcode])
+  @@index([status, nextOutreachWindow])
+  @@index([chPreScore])
 }
 
 model Suppression {
@@ -249,6 +330,82 @@ model CompaniesHouseCache {
   expiresAt     DateTime
 
   @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Director / Officer graph
+//
+// Companies House identifies a natural person by (name + DOB month/year). It
+// does not expose full DOB. We use the (name, dobMonth, dobYear) triple as
+// the de-facto identity, which is what CH itself does internally.
+//
+// A Director may sit on many companies; a Lead may have many directors. The
+// Officer junction carries appointment dates and role.
+// ---------------------------------------------------------------------------
+
+model Director {
+  id                 String    @id @default(uuid()) @db.Uuid
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  /**
+   * Lower-cased, whitespace-collapsed full name.
+   */
+  normalizedName     String
+  fullName           String
+  // 0 = unknown. Composite uniques cannot include nullable fields, and
+  // Companies House anonymises full DOB anyway — only month/year are public.
+  dobMonth           Int       @default(0)
+  dobYear            Int       @default(0)
+  nationality        String?
+  occupation         String?
+  countryOfResidence String?
+  officers           Officer[]
+
+  @@unique([normalizedName, dobMonth, dobYear])
+  @@index([normalizedName])
+}
+
+model Officer {
+  id          String    @id @default(uuid()) @db.Uuid
+  createdAt   DateTime  @default(now())
+  leadId      String    @db.Uuid
+  lead        Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  directorId  String    @db.Uuid
+  director    Director  @relation(fields: [directorId], references: [id], onDelete: Cascade)
+  role        String
+  appointedOn DateTime?
+  resignedOn  DateTime?
+  /**
+   * True if currently in office (no resignation date). Computed at upsert time
+   * so we can index on it for "active directors of company X" queries.
+   */
+  isActive    Boolean   @default(true)
+
+  @@unique([leadId, directorId, role])
+  @@index([leadId, isActive])
+  @@index([directorId, isActive])
+}
+
+// ---------------------------------------------------------------------------
+// Latest filed financials parsed from iXBRL accounts. Mirrors the same data
+// stored on the Lead row (for query convenience), but persisted here keyed by
+// company number for re-use across re-discovery runs and historical tracking.
+// ---------------------------------------------------------------------------
+
+model CompanyFinancials {
+  companyNumber      String    @id
+  fetchedAt          DateTime  @default(now())
+  madeUpTo           DateTime?
+  turnover           BigInt?
+  employeeCount      Int?
+  profitLoss         BigInt?
+  priorTurnover      BigInt?
+  priorEmployeeCount Int?
+  priorProfitLoss    BigInt?
+  rawDocumentId      String?
+  parseError         String?
+
+  @@index([fetchedAt])
 }
 
 model GraphSubscription {

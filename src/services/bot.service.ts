@@ -25,6 +25,24 @@ export interface CardPostResult {
   activityId: string;
 }
 
+/**
+ * Render the persisted Companies House / HMRC facts block as a TextBlock
+ * row so operators can audit exactly what the scorer + drafter were told.
+ * Returns an empty array if no facts block was persisted (Places-only leads,
+ * older rows from before the CH layer landed). Truncated to keep the card
+ * legible — the full block is on the Lead row for deeper inspection.
+ */
+function buildApprovalCardFactsSection(lead: Lead): unknown[] {
+  if (!lead.companyFactsBlock) return [];
+  const truncated = lead.companyFactsBlock.length > 700
+    ? lead.companyFactsBlock.slice(0, 700) + "…"
+    : lead.companyFactsBlock;
+  return [
+    { type: "TextBlock", text: "**Companies House facts:**", spacing: "Medium" },
+    { type: "TextBlock", text: truncated, size: "Small", wrap: true, isSubtle: true },
+  ];
+}
+
 interface SubmitData {
   action: string;
   leadId?: string;
@@ -695,6 +713,8 @@ outcome.wasEdited,
     const config = getNicheConfig();
     const plainBody = lead.draftBodyHtml ? stripHtml(lead.draftBodyHtml) : "No preview";
 
+    const factsBlock = buildApprovalCardFactsSection(lead);
+
     const card = {
       type: "AdaptiveCard",
       $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -713,12 +733,14 @@ outcome.wasEdited,
             { title: "Business", value: lead.businessName },
             { title: "Owner", value: lead.ownerName ?? "Unknown" },
             { title: "Location", value: [lead.city, lead.country].filter(Boolean).join(", ") || "—" },
-            { title: "Score", value: `${lead.brandFitScore ?? "—"}/100 (${lead.tier ?? "Unscored"})` },
+            { title: "Score", value: `${lead.brandFitScore ?? "—"}/100 (${lead.tier ?? "Unscored"}) · CH ${lead.chPreScore ?? "—"}` },
+            { title: "Window", value: lead.nextOutreachWindowReason ?? "—" },
             { title: "LinkedIn", value: (lead as any).linkedin ?? "—" },
             { title: "Email", value: lead.email ?? "—" },
             { title: "Verified", value: lead.emailVerified ? `Score ${lead.verificationScore}/100` : "Not verified" },
           ],
         },
+        ...factsBlock,
         { type: "TextBlock", text: `**${config.brandName} Rationale:**`, spacing: "Medium" },
         { type: "TextBlock", text: lead.brandFitRationale ?? "No rationale available.", size: "Small", wrap: true },
         { type: "TextBlock", text: "**Subject** *(edit below if needed):*", spacing: "Medium" },
@@ -770,6 +792,8 @@ outcome.wasEdited,
     const config = getNicheConfig();
     const plainBody = lead.draftBodyHtml ? stripHtml(lead.draftBodyHtml) : "No preview";
 
+    const factsBlock = buildApprovalCardFactsSection(lead);
+
     const card = {
       type: "AdaptiveCard",
       $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -788,10 +812,12 @@ outcome.wasEdited,
             { title: "Business", value: lead.businessName },
             { title: "Owner", value: lead.ownerName ?? "Unknown" },
             { title: "Location", value: [lead.city, lead.country].filter(Boolean).join(", ") || "—" },
-            { title: "Score", value: `${lead.brandFitScore ?? "—"}/100 (${lead.tier ?? "Unscored"})` },
+            { title: "Score", value: `${lead.brandFitScore ?? "—"}/100 (${lead.tier ?? "Unscored"}) · CH ${lead.chPreScore ?? "—"}` },
+            { title: "Window", value: lead.nextOutreachWindowReason ?? "—" },
             { title: "Email", value: lead.email ?? "—" },
           ],
         },
+        ...factsBlock,
         { type: "TextBlock", text: `**${config.brandName} Rationale:**`, spacing: "Medium" },
         { type: "TextBlock", text: lead.brandFitRationale ?? "No rationale available.", size: "Small", wrap: true },
         { type: "TextBlock", text: "**Subject** *(edit below if needed):*", spacing: "Medium" },

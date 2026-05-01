@@ -2,7 +2,13 @@ import { withRetry } from "./retry.js";
 import { prisma } from "./prisma.js";
 
 const API_BASE = "https://api.company-information.service.gov.uk";
-const CACHE_TTL_HOURS = 24 * 7;  // 1 week — accounts data rarely changes mid-week
+const DOC_API_BASE = "https://document-api.company-information.service.gov.uk";
+
+// Profile changes infrequently — long TTL is fine.
+const PROFILE_CACHE_TTL_HOURS = 24 * 7;
+// Officers/filings/charges/PSC change more often (new appointments, fresh
+// filings). Shorter TTL keeps signals fresh without crushing the rate limit.
+const SUB_RESOURCE_CACHE_TTL_HOURS = 24;
 
 export interface AdvancedSearchOpts {
   sicCodes?: string[];
@@ -133,7 +139,7 @@ export async function getCompanyProfile(companyNumber: string): Promise<CompanyP
   );
 
   if (profile) {
-    const expiresAt = new Date(Date.now() + CACHE_TTL_HOURS * 3600_000);
+    const expiresAt = new Date(Date.now() + PROFILE_CACHE_TTL_HOURS * 3600_000);
     await prisma.companiesHouseCache
       .upsert({
         where: { companyNumber: num },
@@ -144,6 +150,184 @@ export async function getCompanyProfile(companyNumber: string): Promise<CompanyP
   }
 
   return profile;
+}
+
+// ---------------------------------------------------------------------------
+// Sub-resources: officers, filing history, persons-with-significant-control,
+// charges. All cached in a separate generic JSON blob keyed by
+// `${companyNumber}:${resource}` to avoid colliding with the profile cache.
+//
+// We re-use the CompaniesHouseCache table by prefixing the resource name —
+// no new table required, and the existing cleanup index on `expiresAt` works.
+// ---------------------------------------------------------------------------
+
+export interface CompanyOfficer {
+  name: string;
+  officer_role: string;        // "director" | "secretary" | "llp-member" | ...
+  appointed_on?: string;
+  resigned_on?: string;
+  occupation?: string;
+  nationality?: string;
+  country_of_residence?: string;
+  date_of_birth?: { month?: number; year?: number };
+}
+
+export interface OfficersResponse {
+  items?: CompanyOfficer[];
+  total_results?: number;
+  active_count?: number;
+  resigned_count?: number;
+}
+
+export interface FilingHistoryItem {
+  type?: string;
+  category?: string;
+  date?: string;
+  description?: string;
+  description_values?: Record<string, unknown>;
+  transaction_id?: string;
+  links?: { document_metadata?: string };
+}
+
+export interface FilingHistoryResponse {
+  items?: FilingHistoryItem[];
+  total_count?: number;
+}
+
+export interface ChargeItem {
+  charge_number?: number;
+  status?: string;             // "outstanding" | "satisfied" | "part-satisfied"
+  created_on?: string;
+  satisfied_on?: string;
+  delivered_on?: string;
+  classification?: { description?: string };
+  persons_entitled?: Array<{ name?: string }>;
+}
+
+export interface ChargesResponse {
+  items?: ChargeItem[];
+  total_count?: number;
+  unfiltered_count?: number;
+  satisfied_count?: number;
+  part_satisfied_count?: number;
+}
+
+export interface PscItem {
+  name?: string;
+  kind?: string;
+  natures_of_control?: string[];
+  notified_on?: string;
+  ceased_on?: string;
+}
+
+export interface PscResponse {
+  items?: PscItem[];
+  active_count?: number;
+  ceased_count?: number;
+  total_results?: number;
+}
+
+export async function getCompanyOfficers(companyNumber: string): Promise<OfficersResponse | null> {
+  return getSubResource<OfficersResponse>(companyNumber, "officers");
+}
+
+export async function getCompanyFilingHistory(companyNumber: string): Promise<FilingHistoryResponse | null> {
+  return getSubResource<FilingHistoryResponse>(companyNumber, "filing-history?items_per_page=50");
+}
+
+export async function getCompanyCharges(companyNumber: string): Promise<ChargesResponse | null> {
+  return getSubResource<ChargesResponse>(companyNumber, "charges");
+}
+
+export async function getCompanyPSC(companyNumber: string): Promise<PscResponse | null> {
+  return getSubResource<PscResponse>(companyNumber, "persons-with-significant-control");
+}
+
+async function getSubResource<T>(companyNumber: string, path: string): Promise<T | null> {
+  const num = companyNumber.replace(/\s/g, "").toUpperCase();
+  const cacheKey = `${num}:${path}`;
+
+  const cached = await prisma.companiesHouseCache.findUnique({ where: { companyNumber: cacheKey } }).catch(() => null);
+  if (cached && cached.expiresAt > new Date()) {
+    return cached.payload as unknown as T;
+  }
+
+  const data = await withRetry(
+    async () => {
+      const res = await fetch(`${API_BASE}/company/${num}/${path}`, {
+        headers: { Authorization: authHeader() },
+      });
+      if (res.status === 404) return null;
+      if (res.status === 429) throw new Error("CH rate-limited");
+      if (!res.ok) {
+        throw new Error(`CH ${path} ${num} → ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      }
+      return (await res.json()) as T;
+    },
+    `ch:${path}:${num}`,
+    { maxAttempts: 3, baseDelayMs: 2000 },
+  );
+
+  if (data) {
+    const expiresAt = new Date(Date.now() + SUB_RESOURCE_CACHE_TTL_HOURS * 3600_000);
+    await prisma.companiesHouseCache
+      .upsert({
+        where: { companyNumber: cacheKey },
+        create: { companyNumber: cacheKey, payload: data as unknown as object, expiresAt },
+        update: { payload: data as unknown as object, fetchedAt: new Date(), expiresAt },
+      })
+      .catch(() => { /* best-effort */ });
+  }
+
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Document API — fetches the actual filed document content (iXBRL accounts).
+// Uses a different host (document-api.*) and a different field for the body.
+// Returns the iXBRL HTML/XML as a UTF-8 string, ready to feed to the parser.
+// ---------------------------------------------------------------------------
+
+export async function fetchAccountsDocument(filing: FilingHistoryItem): Promise<{
+  documentId: string;
+  content: string;
+} | null> {
+  const docMetaUrl = filing.links?.document_metadata;
+  if (!docMetaUrl) return null;
+
+  // document_metadata link is something like:
+  //   "/document/MzM2Mzc2NTk2OWFkaXF6a2N4"
+  // We need to call /document/{id}/content on the document-api host.
+  const m = docMetaUrl.match(/\/document\/([^/?#]+)/);
+  if (!m) return null;
+  const documentId = m[1];
+
+  return withRetry(
+    async () => {
+      const res = await fetch(`${DOC_API_BASE}/document/${documentId}/content`, {
+        headers: {
+          Authorization: authHeader(),
+          // application/xhtml+xml = iXBRL filings; pdf = older scans (we ignore those).
+          Accept: "application/xhtml+xml, application/xml;q=0.9",
+        },
+        redirect: "follow",
+      });
+      if (res.status === 404 || res.status === 410) return null;
+      if (res.status === 429) throw new Error("CH document rate-limited");
+      if (!res.ok) {
+        throw new Error(`CH document ${documentId} → ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      }
+      const ctype = res.headers.get("content-type") ?? "";
+      if (ctype.includes("pdf")) {
+        // Older scanned filings are PDFs, not iXBRL. We can't parse those.
+        return null;
+      }
+      const content = await res.text();
+      return { documentId, content };
+    },
+    `ch:document:${documentId}`,
+    { maxAttempts: 3, baseDelayMs: 2500 },
+  );
 }
 
 /**
@@ -164,6 +348,7 @@ export function assessFinancialStanding(profile: CompanyProfile): FinancialStand
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
   const cat = (profile.accounts?.accounts_category ?? "").toLowerCase().trim() || null;
+  const lastAccountsType = profile.accounts?.last_accounts?.type ?? null;
 
   if (profile.company_status !== "active") {
     return { passes: false, reason: `status=${profile.company_status}`, accountsCategory: cat };
@@ -176,6 +361,12 @@ export function assessFinancialStanding(profile: CompanyProfile): FinancialStand
   }
   if (profile.confirmation_statement?.overdue) {
     return { passes: false, reason: "confirmation-statement-overdue", accountsCategory: cat };
+  }
+  // The accounts_category gate doesn't catch "active company that filed
+  // dormant last year" — last_accounts.type does. AA02 / DORMANT / MICRO_DORMANT
+  // mean the entity isn't trading; pitching them is wasted spend.
+  if (lastAccountsType && /DORMANT|AA02/i.test(lastAccountsType)) {
+    return { passes: false, reason: `last-accounts-type=${lastAccountsType}`, accountsCategory: cat };
   }
   if (!cat) {
     return { passes: false, reason: "no-accounts-category", accountsCategory: cat };

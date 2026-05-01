@@ -153,6 +153,7 @@ export function normalizeEmail(raw: string | null | undefined): string | null {
 // ---------------------------------------------------------------------------
 
 export type DedupMatchType =
+  | "place_id"
   | "companies_house_number"
   | "domain"
   | "email"
@@ -178,6 +179,8 @@ export interface DedupInput {
   address?: string | null;
   outwardPostcode?: string | null;
   companiesHouseNumber?: string | null;
+  /** Google Places ID — globally unique, cheapest authoritative match. */
+  googlePlaceId?: string | null;
   /** When dedup-ing an enrichment update for an existing lead, exclude that
    * lead's own id from the matchers — otherwise it always matches itself. */
   excludeLeadId?: string | null;
@@ -201,6 +204,15 @@ export async function checkDuplicate(opts: DedupInput): Promise<DedupResult> {
   const exclude = opts.excludeLeadId
     ? { id: { not: opts.excludeLeadId } }
     : {};
+
+  // ── L0: Google Place ID — globally unique, skip everything else ────────
+  if (opts.googlePlaceId) {
+    const m = await prisma.lead.findFirst({
+      where: { googlePlaceId: opts.googlePlaceId, ...exclude },
+      select: { id: true, businessName: true },
+    });
+    if (m) return hit(m.id, m.businessName, "place_id", 1);
+  }
 
   // ── L1: Companies House number — definitive ───────────────────────────
   if (chNumber) {

@@ -177,12 +177,17 @@ Return ONLY the JSON object. No markdown. No preamble.`,
   // produces is injected directly into the outreach draft prompt, so rationale
   // quality determines email quality. Runs on Sonnet.
   // -------------------------------------------------------------------------
-  async scoreBrandFit(researchJson: unknown): Promise<ScoringResult> {
+  async scoreBrandFit(researchJson: unknown, companyFactsBlock?: string | null): Promise<ScoringResult> {
     const config = getNicheConfig();
     const researchStr =
       typeof researchJson === "string"
         ? researchJson
         : JSON.stringify(researchJson, null, 2);
+
+    const factsSection = companyFactsBlock
+      ? `\n\nAUTHORITATIVE COMPANIES HOUSE / HMRC FACTS (these are the source of truth — they come from filings, not website inference. Override anything in the research data that contradicts them):
+${companyFactsBlock}\n`
+      : "";
 
     return callClaudeSonnetJson<ScoringResult>({
       label: "scoring",
@@ -193,8 +198,8 @@ Return ONLY the JSON object. No markdown. No preamble.`,
       userPrompt: `You are evaluating a UK SME as a potential client for ${config.brandName}.
 
 ${getBrandContextPrompt()}
-
-BUSINESS RESEARCH DATA:
+${factsSection}
+BUSINESS RESEARCH DATA (from web search — may be incomplete or out-of-date):
 ${researchStr}
 
 TASK: Score this business 0-100 on fit as a Begility client. Fit means:
@@ -307,6 +312,7 @@ Return a single JSON object only:
       primary_pain_hypothesis?: string;
       suggested_lane?: string;
     };
+    companyFactsBlock?: string | null;
   }): Promise<FollowUpResult> {
     const config = getNicheConfig();
     const signature = getEmailSignature();
@@ -327,6 +333,7 @@ ${opts.originalBodyPlain.slice(0, 400)}
 
 Business research context:
 ${JSON.stringify(opts.researchContext, null, 2)}
+${opts.companyFactsBlock ? `\nAUTHORITATIVE COMPANIES HOUSE / HMRC FACTS (override anything in the research that contradicts these — they're filing-derived, not website inference):\n${opts.companyFactsBlock}\n` : ""}
 
 STRATEGY: The first email didn't land. This follow-up must take a DIFFERENT angle. Study the research context and switch lens: if the first note led with lead leakage, try admin / handoffs; if it led with process, try visibility / reporting; if it was broad, get specific on one observable signal. Another option: lower the commitment — instead of a discovery call, offer to send a short worked example or a one-pager of what we built for a similar business.
 
@@ -427,6 +434,7 @@ Return a single JSON object only:
     researchContext: unknown;
     brandFitRationale: string | null;
     primaryPainHypothesis: string | null;
+    companyFactsBlock?: string | null;
   }): Promise<FollowUpResult> {
     const config = getNicheConfig();
     const signature = getEmailSignature();
@@ -457,7 +465,7 @@ ${opts.replyBody.slice(0, 1500)}
 
 What we already know about their business (from research + scoring):
 ${typeof opts.researchContext === "string" ? opts.researchContext : JSON.stringify(opts.researchContext, null, 2)}
-
+${opts.companyFactsBlock ? `\nAUTHORITATIVE COMPANIES HOUSE / HMRC FACTS (override the research above when they conflict — these are filing-derived):\n${opts.companyFactsBlock}\n` : ""}
 Our internal fit rationale (for grounding only — do not quote):
 ${opts.brandFitRationale ?? "—"}
 

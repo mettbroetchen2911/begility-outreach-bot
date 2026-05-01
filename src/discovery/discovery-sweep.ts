@@ -7,8 +7,13 @@ import {
   normalizePhoneE164,
 } from "../utils/dedup.js";
 import { validateWebsite } from "../utils/website-validator.js";
-import { discoverFromCompaniesHouse } from "./companies-house-discovery.js";
+import {
+  discoverFromCompaniesHouse,
+  linkOfficersToLead,
+  getCompanyOfficers,
+} from "./companies-house-discovery.js";
 import { discoverFromPlaces } from "./places-discovery.js";
+import { buildCompanyFactsBlock } from "../utils/ch-signals.js";
 
 const TARGET_NEW = parseInt(process.env.MAX_NEW_LEADS_PER_SWEEP ?? "50", 10);
 const MAX_ATTEMPTS = parseInt(process.env.MAX_DISCOVERY_ATTEMPTS ?? "30", 10);
@@ -26,6 +31,9 @@ interface SweepState {
   totalSkipped: number;
   totalInvalidWebsites: number;
   totalRejectedFinancialStanding: number;
+  totalRejectedPreScore: number;
+  totalRejectedNomineeAddress: number;
+  totalFlaggedSubsidiary: number;
   attempts: number;
   runs: Array<{
     source: string;
@@ -81,7 +89,16 @@ async function scanCompaniesHouse(
     const result = await discoverFromCompaniesHouse({ location, sicCodes, incorporatedBefore });
     state.totalDiscovered += result.businesses.length;
     state.totalRejectedFinancialStanding += result.rejectedFinancialStanding;
-    console.log(`    CH found ${result.businesses.length} qualifying businesses (${result.rejectedFinancialStanding} rejected on financial standing)`);
+    state.totalRejectedPreScore += result.rejectedPreScore;
+    state.totalRejectedNomineeAddress += result.rejectedNomineeAddress;
+    state.totalFlaggedSubsidiary += result.flaggedSubsidiary;
+    console.log(
+      `    CH found ${result.businesses.length} qualifying businesses ` +
+      `(${result.rejectedFinancialStanding} rejected financial-standing, ` +
+      `${result.rejectedPreScore} below pre-score floor, ` +
+      `${result.rejectedNomineeAddress} nominee-address, ` +
+      `${result.flaggedSubsidiary} subsidiary-flagged)`,
+    );
 
     for (const biz of result.businesses) {
       if (state.totalNew >= TARGET_NEW) break;
@@ -98,7 +115,33 @@ async function scanCompaniesHouse(
         continue;
       }
 
-      await prisma.lead.create({
+      const sig = biz.signals;
+      const acc = biz.accounts;
+
+      const factsBlock = sig
+        ? buildCompanyFactsBlock({
+            businessName: biz.businessName,
+            companiesHouseNumber: biz.companiesHouseNumber,
+            incorporatedOn: biz.incorporatedOn,
+            accountsCategory: biz.accountsCategory,
+            sicCodes: biz.sicCodes,
+            signals: sig,
+            accounts: acc,
+            vatRegistered: null,
+            vatNumber: null,
+          })
+        : null;
+
+      const turnoverGrowthPct =
+        acc?.turnover != null && acc?.priorTurnover != null && acc.priorTurnover > 0n
+          ? (Number(acc.turnover) - Number(acc.priorTurnover)) / Number(acc.priorTurnover)
+          : null;
+      const employeeGrowthPct =
+        acc?.employeeCount != null && acc?.priorEmployeeCount != null && acc.priorEmployeeCount > 0
+          ? (acc.employeeCount - acc.priorEmployeeCount) / acc.priorEmployeeCount
+          : null;
+
+      const created = await prisma.lead.create({
         data: {
           businessName: biz.businessName,
           normalizedName: normalizeBusinessName(biz.businessName),
@@ -111,11 +154,62 @@ async function scanCompaniesHouse(
           accountsCategory: biz.accountsCategory,
           incorporatedOn: biz.incorporatedOn,
           companyStatus: biz.companyStatus,
-          status: "new_lead",
           discoverySource: "companies_house",
           discoveryQuery: sicCodes.join(","),
+          ownerName: biz.ownerName,
+          // CH-derived signals
+          accountsLastMadeUpTo: sig?.accountsLastMadeUpTo ?? null,
+          accountsNextDue: sig?.accountsNextDue ?? null,
+          confirmationNextDue: sig?.confirmationNextDue ?? null,
+          directorCount: sig?.directorCount ?? null,
+          earliestDirectorAppointedOn: sig?.earliestDirectorAppointedOn ?? null,
+          latestDirectorAppointedOn: sig?.latestDirectorAppointedOn ?? null,
+          activeChargesCount: sig?.activeChargesCount ?? null,
+          recentChargeCreatedOn: sig?.recentChargeCreatedOn ?? null,
+          registeredOfficeMovedOn: sig?.registeredOfficeMovedOn ?? null,
+          pscCount: sig?.pscCount ?? null,
+          // Latest filed financials
+          latestTurnover: acc?.turnover ?? null,
+          latestEmployeeCount: acc?.employeeCount ?? null,
+          priorYearTurnover: acc?.priorTurnover ?? null,
+          priorYearEmployeeCount: acc?.priorEmployeeCount ?? null,
+          turnoverGrowthPct,
+          employeeGrowthPct,
+          latestAccountsMadeUpTo: acc?.madeUpTo ?? null,
+          latestProfitLoss: acc?.profitLoss ?? null,
+          // Composite pre-score
+          chPreScore: sig?.preScore ?? null,
+          chSignals: sig?.signals ?? [],
+          companyFactsBlock: factsBlock,
+          // Send-window
+          nextOutreachWindow: biz.nextOutreachWindow,
+          nextOutreachWindowReason: biz.nextOutreachWindowReason,
+          // Tier-5 audit fields
+          lastAccountsType: biz.lastAccountsType,
+          nomineeAddress: biz.nomineeAddress,
+          subsidiaryOfLeadId: biz.subsidiaryOfLeadId,
+          corporatePscCount: biz.corporatePscCount,
+          recentNameChangeCount: biz.recentNameChangeCount,
+          // Subsidiaries that survive the policy land in `needs_review` so
+          // an operator picks whether to pitch the parent or the entity.
+          status: biz.subsidiaryOfLeadId ? "needs_review" : "new_lead",
+          notes: biz.subsidiaryOfLeadId
+            ? `Likely subsidiary of lead ${biz.subsidiaryOfLeadId} — same registered office and overlapping directors. Consider pitching the parent instead.`
+            : null,
         },
       });
+
+      // Director graph: link officers we already fetched during enrichment.
+      // We re-fetch from cache (free hit) rather than threading the array
+      // through return shapes; the cache TTL is 24h so this is essentially
+      // a single additional in-process call.
+      try {
+        const officers = await getCompanyOfficers(biz.companiesHouseNumber);
+        if (officers?.items) {
+          await linkOfficersToLead(created.id, officers.items);
+        }
+      } catch { /* best-effort */ }
+
       scanNew++;
       state.totalNew++;
     }
@@ -180,6 +274,7 @@ async function scanPlaces(
         phone: biz.phone,
         outwardPostcode: biz.outwardPostcode,
         address: biz.address,
+        googlePlaceId: biz.googlePlaceId,
       });
       if (dedup.isDuplicate) {
         scanDuplicates++;
@@ -254,6 +349,9 @@ export async function runDiscoverySweep() {
   const state: SweepState = {
     totalNew: 0, totalDiscovered: 0, totalDuplicates: 0,
     totalSkipped: 0, totalInvalidWebsites: 0, totalRejectedFinancialStanding: 0,
+    totalRejectedPreScore: 0,
+    totalRejectedNomineeAddress: 0,
+    totalFlaggedSubsidiary: 0,
     attempts: 0, runs: [], startTime: Date.now(),
   };
 
@@ -310,6 +408,9 @@ export async function runDiscoverySweep() {
     skipped: state.totalSkipped,
     invalidWebsites: state.totalInvalidWebsites,
     rejectedFinancialStanding: state.totalRejectedFinancialStanding,
+    rejectedPreScore: state.totalRejectedPreScore,
+    rejectedNomineeAddress: state.totalRejectedNomineeAddress,
+    flaggedSubsidiary: state.totalFlaggedSubsidiary,
     attempts: state.attempts,
     durationMs: Date.now() - state.startTime,
     stopReason,

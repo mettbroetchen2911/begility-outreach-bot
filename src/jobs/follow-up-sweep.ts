@@ -71,7 +71,13 @@ export async function runFollowUpSweep(): Promise<{
           description: typeof research.description === "string" ? research.description : undefined,
           instagram: typeof research.instagram === "string" ? research.instagram : undefined,
           location: typeof research.location === "string" ? research.location : undefined,
-        } as any, 
+          primary_pain_hypothesis: lead.primaryPainHypothesis ?? undefined,
+          suggested_lane: lead.suggestedLane ?? undefined,
+        } as any,
+        // Pass the persisted CH facts block so the follow-up doesn't drift
+        // into website-vibes territory — same authoritative grounding the
+        // first email had.
+        companyFactsBlock: lead.companyFactsBlock,
       });
 
       const draft = await emailSvc.createDraft(lead.email, followUp.subject_line, followUp.email_body_html);
