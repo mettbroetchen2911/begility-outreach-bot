@@ -47,6 +47,8 @@ if (dailyCap > 0) {
 
 // ── Stale-lock recovery — release locks left behind by crashed runs ──
 const staleCutoff = new Date(Date.now() - STALE_LOCK_MINUTES * 60_000);
+
+// 1. Release stale locks
 const released = await prisma.lead.updateMany({
   where: {
     enrichmentLock: true,
@@ -59,6 +61,17 @@ const released = await prisma.lead.updateMany({
 });
 if (released.count > 0) {
   console.log(`Orchestrator: released ${released.count} stale enrichment lock(s).`);
+}
+const recovered = await prisma.lead.updateMany({
+  where: {
+    status: { in: ["enriching", "verifying"] },
+    enrichmentLock: false,
+    updatedAt: { lt: staleCutoff },
+  },
+  data: { status: "new_lead" },
+});
+if (recovered.count > 0) {
+  console.log(`Orchestrator: recovered ${recovered.count} orphaned lead(s) → new_lead.`);
 }
 
 const now = new Date();
@@ -413,12 +426,15 @@ await prisma.lead.update({
         leadId: lead.id,
       });
       await prisma.lead.update({
-        where: { id: lead.id },
-        data: { enrichmentLock: false },
-      }).catch(() => { /* swallow */ });
-      results.push({ leadId: lead.id, businessName: lead.businessName, outcome: `error: ${message.slice(0, 100)}` });
-    }
-  }
+    where: { id: lead.id },
+    data: {
+      enrichmentLock: false,
+      enrichmentLockedAt: null,
+      status: "new_lead",
+    },
+  }).catch(() => { /* swallow */ });
+  results.push({ leadId: lead.id, businessName: lead.businessName, outcome: `error: ${message.slice(0, 100)}` });
+}
 
   console.log(`\nOrchestrator complete: ${results.length} processed.`);
   return { processed: results.length, results };
