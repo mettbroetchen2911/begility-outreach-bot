@@ -1,21 +1,5 @@
 import { withRetry } from "../utils/retry.js";
 
-// ---------------------------------------------------------------------------
-// Google Places API (New) — Text Search
-//   https://developers.google.com/maps/documentation/places/web-service/text-search
-//
-// We use Text Search rather than Nearby Search because the discovery queries
-// in NICHE config are natural-language phrases ("recruitment agency",
-// "estate agent") that don't map cleanly to Places `includedType` enums.
-// Text Search accepts the phrase verbatim and returns up to 60 results
-// across 3 paginated calls.
-//
-// Cost shape (current public pricing):
-//   - Text Search "Pro" SKU (with website + types): ~$32 / 1000 calls
-//   - 3 pages per (query, region) = ~$0.10 per query×region
-// Returns the website in-line, so no separate Place Details fetch is needed.
-// ---------------------------------------------------------------------------
-
 const ENDPOINT = "https://places.googleapis.com/v1/places:searchText";
 
 const FIELD_MASK = [
@@ -195,11 +179,12 @@ function mapPlace(p: NonNullable<PlacesApiResponse["places"]>[number]): PlacesDi
   if (!displayName.trim()) return null;
 
   const components = p.addressComponents ?? [];
-  const cityComp = components.find((c) =>
-    c.types.includes("postal_town") || c.types.includes("locality")
-  );
-  const countryComp = components.find((c) => c.types.includes("country"));
-  const postcodeComp = components.find((c) => c.types.includes("postal_code"));
+const hasType = (c: { types?: string[] } | undefined, t: string): boolean =>
+  Array.isArray(c?.types) && c.types.includes(t);
+
+const cityComp = components.find((c) => hasType(c, "postal_town") || hasType(c, "locality"));
+const countryComp = components.find((c) => hasType(c, "country"));
+const postcodeComp = components.find((c) => hasType(c, "postal_code"));
   const outward = postcodeComp?.shortText
     ? postcodeComp.shortText.toUpperCase().split(/\s+/)[0]
     : null;
