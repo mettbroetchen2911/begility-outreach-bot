@@ -175,8 +175,10 @@ model Lead {
   employeeCountEstimate String?
   techStackSignals      String[]
   operationalSignals    String[]
-  businessDescription   String?  @db.Text
+  businessDescription   String? @db.Text
   searchConfidence      Int?
+
+  scrapeAttempts        Int       @default(0)
 
   emailVerified     Boolean   @default(false)
   emailVerifiedAt   DateTime?
