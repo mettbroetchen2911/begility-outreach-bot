@@ -426,15 +426,16 @@ await prisma.lead.update({
         leadId: lead.id,
       });
       await prisma.lead.update({
-    where: { id: lead.id },
-    data: {
-      enrichmentLock: false,
-      enrichmentLockedAt: null,
-      status: "new_lead",
-    },
-  }).catch(() => { /* swallow */ });
-  results.push({ leadId: lead.id, businessName: lead.businessName, outcome: `error: ${message.slice(0, 100)}` });
-}
+        where: { id: lead.id },
+        data: {
+          enrichmentLock: false,
+          enrichmentLockedAt: null,
+          status: "new_lead",
+        },
+      }).catch(() => { /* swallow */ });
+      results.push({ leadId: lead.id, businessName: lead.businessName, outcome: `error: ${message.slice(0, 100)}` });
+    }
+  }
 
   console.log(`\nOrchestrator complete: ${results.length} processed.`);
   return { processed: results.length, results };
