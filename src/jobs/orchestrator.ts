@@ -14,11 +14,7 @@ import { extractVrnFromText, checkVatNumber } from "../utils/vat-check.js";
 import { buildCompanyFactsBlock, type ChSignalSummary } from "../utils/ch-signals.js";
 import type { ParsedAccounts } from "../utils/ixbrl-parser.js";
 
-// ── Stale-lock recovery: locks older than this are assumed to belong to a
-// crashed previous run and are released at the start of each orchestrator run.
 const STALE_LOCK_MINUTES = parseInt(process.env.ENRICHMENT_LOCK_TTL_MIN ?? "30", 10);
-// Per-lead processing cap — a single misbehaving lead must not stall the
-// batch indefinitely.
 const PER_LEAD_TIMEOUT_MS = parseInt(process.env.ORCHESTRATOR_PER_LEAD_TIMEOUT_MS ?? "180000", 10);
 
 const email = new EmailService();
@@ -157,6 +153,8 @@ const mergedEmail =
   scrape?.email ?? research.email ?? lead.email ?? null;
 const mergedPhone =
   scrape?.phone ?? research.phone ?? lead.phone ?? null;
+const mergedPhoneE164 =
+  scrape?.phone_e164 ?? normalizePhoneE164(mergedPhone);
 const mergedOwner =
   authoritativeOwner ?? scrape?.owner_name ?? research.owner_name ?? lead.ownerName;
 const mergedDescription =
@@ -172,53 +170,62 @@ await prisma.lead.update({
     ownerName: mergedOwner,
     email: emailNormalized,
     phone: mergedPhone,
-    phoneE164,
+    phoneE164: mergedPhoneE164,
     instagram: scrape?.instagram ?? (research as any).instagram ?? lead.instagram,
+    linkedin: scrape?.linkedin ?? research.linkedin ?? lead.linkedin,
     websiteUrl: resolvedWebsite,
     businessDescription: mergedDescription,
   },
 });
 
-// =====================================================================
-// STEP 3: Email gate — now downstream of the scrape, with split outcomes
-// so we can see WHY a lead failed in the run summary.
-// =====================================================================
+const SCRAPE_MAX_ATTEMPTS = 3;
+
 if (!emailNormalized) {
-  // Decide which exclude bucket — and whether this should retry instead.
   let outcome: string;
   let nextStatus: "exclude" | "new_lead";
+  let nextScrapeAttempts = lead.scrapeAttempts ?? 0;
 
   if (!resolvedWebsite) {
     outcome = "no_email_no_website";
     nextStatus = "exclude";
   } else if (scrapeOutcome === "failed") {
-    outcome = "no_email_scrape_failed";
-    nextStatus = "new_lead";
+    nextScrapeAttempts += 1;
+    if (nextScrapeAttempts >= SCRAPE_MAX_ATTEMPTS) {
+      outcome = "no_email_scrape_failed_max_retries";
+      nextStatus = "exclude";
+    } else {
+      outcome = "no_email_scrape_failed";
+      nextStatus = "new_lead";
+    }
   } else {
     outcome = "no_email_scrape_empty";
     nextStatus = "exclude";
   }
 
-  console.log(`  No email after research+scrape → ${outcome} (status=${nextStatus}).`);
+  console.log(`  No email after research+scrape → ${outcome} (status=${nextStatus}, attempts=${nextScrapeAttempts}).`);
   await prisma.lead.update({
     where: { id: lead.id },
-    data: { status: nextStatus, enrichmentLock: false },
+    data: {
+      status: nextStatus,
+      enrichmentLock: false,
+      scrapeAttempts: nextScrapeAttempts,
+    },
   });
   results.push({ leadId: lead.id, businessName: lead.businessName, outcome });
   continue;
 }
       
-      const postResearchDedup = await checkDuplicate({
-        businessName: lead.businessName,
-        website: research.website ?? lead.websiteUrl,
-        city: lead.city,
-        phone: research.phone ?? lead.phone,
-        email: emailNormalized,
-        address: lead.address,
-        outwardPostcode: lead.outwardPostcode,
-        companiesHouseNumber: lead.companiesHouseNumber,
-        excludeLeadId: lead.id,
-      });
+  const postResearchDedup = await checkDuplicate({
+    businessName: lead.businessName,
+    website: resolvedWebsite,
+    city: lead.city,
+    phone: mergedPhone,
+    email: emailNormalized,
+    address: lead.address,
+    outwardPostcode: lead.outwardPostcode,
+    companiesHouseNumber: lead.companiesHouseNumber,
+    excludeLeadId: lead.id,
+  });
       if (postResearchDedup.isDuplicate) {
         console.log(
           `  Duplicate of "${postResearchDedup.matchedBusinessName}" ` +
@@ -273,23 +280,25 @@ if (!emailNormalized) {
       }
       console.log(`  [3/7] Verified: ${verification.verificationScore}/100`);
 
-      // =====================================================================
-      // STEP 4-5: Brand Fit Scoring
-      //
-      // Feed the scorer the authoritative CH facts (turnover, headcount,
-      // director identity, signals) alongside the Gemini research. This is
-      // the single biggest quality lift in the pipeline — Sonnet will rank
-      // an SME with a real £4m turnover + 25 staff + recent director
-      // change very differently to a guess based on website vibes.
-      // =====================================================================
-      console.log("  [4/7] Scoring...");
-      // Use the persisted facts block when available — populated by CH
-      // discovery, refreshed below at the scrape/VAT step. Avoids re-rendering
-      // and ensures every prompt in the run sees the same source-of-truth.
-      const scoringLead = await prisma.lead.findUnique({ where: { id: lead.id } });
-      const scoringFacts = scoringLead?.companyFactsBlock
-        ?? (scoringLead ? buildCompanyFactsBlockFromLead(scoringLead) : null);
-      const scoring = await ai.scoreBrandFit(research, scoringFacts);
+console.log("  [4/8] Scoring...");
+const scoringLead = await prisma.lead.findUnique({ where: { id: lead.id } });
+const scoringFacts = scoringLead?.companyFactsBlock
+  ?? (scoringLead ? buildCompanyFactsBlockFromLead(scoringLead) : null);
+const scoringInput = {
+  ...research,
+  owner_name: mergedOwner ?? research.owner_name,
+  description: mergedDescription ?? research.description,
+  website: resolvedWebsite ?? research.website,
+  scraped_services: scrape?.services ?? null,
+  scraped_positioning: scrape?.positioning ?? null,
+  scraped_clientele: scrape?.clientele ?? null,
+  scraped_location: scrape?.location ?? null,
+  scraped_address: scrape?.address ?? null,
+  scraped_people: scrape?.people ?? null,
+  scrape_confidence: scrape?.confidence ?? null,
+};
+
+const scoring = await ai.scoreBrandFit(scoringInput, scoringFacts);
 
       // Enforce tier thresholds from config
       let tier: "Tier1" | "Tier2" | "Exclude";
@@ -486,12 +495,6 @@ return { processed: results.length, results, outcomeCounts };
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Race a promise against a timeout. If the promise doesn't settle in time,
- * we throw — caller's existing try/catch records the failure and unlocks
- * the lead. Prevents a single misbehaving scrape / Gemini call from
- * stalling the whole batch.
- */
 async function withLeadTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: NodeJS.Timeout;
   return Promise.race([
@@ -502,12 +505,6 @@ async function withLeadTimeout<T>(p: Promise<T>, ms: number, label: string): Pro
   ]).finally(() => clearTimeout(timer!));
 }
 
-/**
- * Render the CH facts block for a Lead row. Mirrors
- * `buildCompanyFactsBlock()` in `ch-signals.ts`, but reads from the
- * persisted Lead row rather than the fresh CH snapshot — so the orchestrator
- * doesn't have to re-fetch everything from CH.
- */
 function buildCompanyFactsBlockFromLead(lead: {
   businessName: string;
   companiesHouseNumber: string | null;
