@@ -124,7 +124,7 @@ export class AIService {
         }
       },
       opts.label,
-      { maxAttempts: 3, baseDelayMs: 2000 }
+      { maxAttempts: 5, baseDelayMs: 5000 }
     );
   }
 
