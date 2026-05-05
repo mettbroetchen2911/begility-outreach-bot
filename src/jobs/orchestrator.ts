@@ -111,60 +111,91 @@ for (const lead of leads) {
 
       console.log(`\n[${lead.businessName}]${lead.chPreScore != null ? ` chPreScore=${lead.chPreScore}` : ""}`);
 
-      // =====================================================================
-      // STEP 1-2: Research + Data Enrichment
-      //
-      // If we already have an authoritative owner from CH officers, the
-      // research call is for description / signals only — Gemini doesn't
-      // need to guess the decision-maker name.
-      // =====================================================================
-      // STEP 1-2: Research + Data Enrichment
-      console.log("  [1/7] Researching...");
-      const research = await withLeadTimeout(
-        // Pass the websiteUrl to the AI so it knows where to look
-        ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
-        PER_LEAD_TIMEOUT_MS,
-        `research:${lead.businessName}`,
-      );
+console.log("  [1/8] Researching...");
+const research = await withLeadTimeout(
+  ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
+  PER_LEAD_TIMEOUT_MS,
+  `research:${lead.businessName}`,
+);
 
-      // CH officer name is authoritative — never let Gemini overwrite it.
-      const authoritativeOwner = lead.ownerName;
+const authoritativeOwner = lead.ownerName;
 
-      // Normalise contact signals before persistence so downstream dedup &
-      // suppression queries see the same canonical form.
-      const emailNormalized = normalizeEmail(research.email ?? lead.email);
-      const phoneE164 = normalizePhoneE164(research.phone ?? lead.phone);
+const resolvedWebsite = research.website ?? lead.websiteUrl ?? null;
 
-      await prisma.lead.update({
-        where: { id: lead.id },
-        data: {
-          geminiResearchJson: research as any,
-          ownerName: authoritativeOwner ?? research.owner_name ?? lead.ownerName,
-          email: emailNormalized,
-          phone: research.phone ?? lead.phone,
-          phoneE164,
-          instagram: (research as any).instagram ?? lead.instagram,
-          websiteUrl: research.website ?? lead.websiteUrl,
-          businessDescription: research.description ?? lead.businessDescription,
-        },
-      });
+let scrape: Awaited<ReturnType<typeof scrapeBusinessWebsiteV2>> | null = null;
+let scrapeOutcome: "ok" | "empty" | "failed" | "skipped" = "skipped";
 
-      if (!emailNormalized) {
-        console.log("  No email found — excluding.");
-        await prisma.lead.update({
-          where: { id: lead.id },
-          data: { status: "exclude", enrichmentLock: false },
-        });
-        results.push({ leadId: lead.id, businessName: lead.businessName, outcome: "no_email" });
-        continue;
-      }
+if (resolvedWebsite) {
+  console.log("  [2/8] Scraping website...");
+  try {
+    scrape = await withLeadTimeout(
+      scrapeBusinessWebsiteV2(resolvedWebsite, lead.businessName, lead.city ?? undefined),
+      PER_LEAD_TIMEOUT_MS,
+      `scrape:${lead.businessName}`,
+    );
+    scrapeOutcome = scrape?.email ? "ok" : "empty";
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`  Scrape failed: ${msg.slice(0, 120)} — continuing without scrape.`);
+    scrapeOutcome = "failed";
+  }
+}
 
-      // ── Post-research dedup ───────────────────────────────────────────
-      // The lead row was created at discovery with only name/address. Now
-      // that we have an email + phone + (maybe) website, run dedup again
-      // — excluding this lead's own id — to catch the case where the same
-      // business surfaced under two different names (e.g. trading name vs
-      // registered name) and they only collide on contact details.
+const mergedEmail =
+  scrape?.email ?? research.email ?? lead.email ?? null;
+const mergedPhone =
+  scrape?.phone ?? research.phone ?? lead.phone ?? null;
+const mergedOwner =
+  authoritativeOwner ?? scrape?.owner_name ?? research.owner_name ?? lead.ownerName;
+const mergedDescription =
+  scrape?.description ?? research.description ?? lead.businessDescription;
+
+const emailNormalized = normalizeEmail(mergedEmail);
+const phoneE164 = normalizePhoneE164(mergedPhone);
+
+await prisma.lead.update({
+  where: { id: lead.id },
+  data: {
+    geminiResearchJson: research as any,
+    ownerName: mergedOwner,
+    email: emailNormalized,
+    phone: mergedPhone,
+    phoneE164,
+    instagram: scrape?.instagram ?? (research as any).instagram ?? lead.instagram,
+    websiteUrl: resolvedWebsite,
+    businessDescription: mergedDescription,
+  },
+});
+
+// =====================================================================
+// STEP 3: Email gate — now downstream of the scrape, with split outcomes
+// so we can see WHY a lead failed in the run summary.
+// =====================================================================
+if (!emailNormalized) {
+  // Decide which exclude bucket — and whether this should retry instead.
+  let outcome: string;
+  let nextStatus: "exclude" | "new_lead";
+
+  if (!resolvedWebsite) {
+    outcome = "no_email_no_website";
+    nextStatus = "exclude";
+  } else if (scrapeOutcome === "failed") {
+    outcome = "no_email_scrape_failed";
+    nextStatus = "new_lead";
+  } else {
+    outcome = "no_email_scrape_empty";
+    nextStatus = "exclude";
+  }
+
+  console.log(`  No email after research+scrape → ${outcome} (status=${nextStatus}).`);
+  await prisma.lead.update({
+    where: { id: lead.id },
+    data: { status: nextStatus, enrichmentLock: false },
+  });
+  results.push({ leadId: lead.id, businessName: lead.businessName, outcome });
+  continue;
+}
+      
       const postResearchDedup = await checkDuplicate({
         businessName: lead.businessName,
         website: research.website ?? lead.websiteUrl,
@@ -268,22 +299,8 @@ tier = "Tier2";
       });
       console.log(`  Score: ${scoring.brand_fit_score}/100 → ${tier} (AI suggested: ${scoring.recommended_tier})`);
 
-      // =====================================================================
-      // STEP 6: Email Drafting
-      // =====================================================================
-      console.log(" [5/7] Scraping + drafting email...");
-// Apollo-grade scrape (cached per-domain for SCRAPE_CACHE_HOURS)
-const scrape = lead.websiteUrl
-? await withLeadTimeout(
-    scrapeBusinessWebsiteV2(lead.websiteUrl, lead.businessName, lead.city ?? undefined),
-    PER_LEAD_TIMEOUT_MS,
-    `scrape:${lead.businessName}`,
-  )
-: null;
+      console.log("  [6/8] Drafting email...");
 
-// ── VAT enrichment — extract VRN from scraped pages, then check HMRC ──
-// Best-effort: any failure leaves vatRegistered=null and the orchestrator
-// continues. The scoring + drafter both treat null as "unknown".
 let vatNumber = lead.vatNumber;
 let vatRegistered = lead.vatRegistered;
 let vatEffectiveFrom = lead.vatEffectiveFrom;
@@ -439,8 +456,18 @@ await prisma.lead.update({
     }
   }
 
-  console.log(`\nOrchestrator complete: ${results.length} processed.`);
-  return { processed: results.length, results };
+  const outcomeCounts = results.reduce<Record<string, number>>((acc, r) => {
+  acc[r.outcome] = (acc[r.outcome] ?? 0) + 1;
+  return acc;
+}, {});
+
+console.log(`\nOrchestrator complete: ${results.length} processed.`);
+console.log("Outcomes:");
+for (const [outcome, count] of Object.entries(outcomeCounts).sort((a, b) => b[1] - a[1])) {
+  console.log(`  ${outcome.padEnd(32)} ${count}`);
+}
+
+return { processed: results.length, results, outcomeCounts };
 }
 
 // ---------------------------------------------------------------------------
