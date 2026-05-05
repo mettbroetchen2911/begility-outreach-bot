@@ -118,9 +118,11 @@ for (const lead of leads) {
       // research call is for description / signals only — Gemini doesn't
       // need to guess the decision-maker name.
       // =====================================================================
+      // STEP 1-2: Research + Data Enrichment
       console.log("  [1/7] Researching...");
       const research = await withLeadTimeout(
-        ai.runResearch(lead.businessName, lead.city ?? ""),
+        // Pass the websiteUrl to the AI so it knows where to look
+        ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
         PER_LEAD_TIMEOUT_MS,
         `research:${lead.businessName}`,
       );
