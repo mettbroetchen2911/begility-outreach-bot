@@ -103,14 +103,26 @@ console.log(`Orchestrator: processing ${leads.length} leads…`);
 
 for (const lead of leads) {
     try {
-      // Lock the lead (with timestamp so stale locks can be released later)
-      await prisma.lead.update({
-        where: { id: lead.id },
-        data: { enrichmentLock: true, enrichmentLockedAt: new Date(), status: "enriching" },
+      const acquired = await prisma.lead.updateMany({
+        where: {
+          id: lead.id,
+          status: "new_lead",
+          enrichmentLock: false,
+        },
+        data: {
+          enrichmentLock: true,
+          enrichmentLockedAt: new Date(),
+          status: "enriching",
+        },
       });
+      if (acquired.count === 0) {
+        console.log(`\n[${lead.businessName}] skipped — already locked by another runner.`);
+        results.push({ leadId: lead.id, businessName: lead.businessName, outcome: "skipped_locked" });
+        continue;
+      }
 
-      console.log(`\n[${lead.businessName}]${lead.chPreScore != null ? ` chPreScore=${lead.chPreScore}` : ""}`);
-
+console.log(`\n[${lead.businessName}]${lead.chPreScore != null ? ` chPreScore=${lead.chPreScore}` : ""}`);
+      
 console.log("  [1/8] Researching...");
 const research = await withLeadTimeout(
   ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
