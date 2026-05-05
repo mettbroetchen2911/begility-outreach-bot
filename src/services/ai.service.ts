@@ -128,23 +128,19 @@ export class AIService {
     );
   }
 
-  // -------------------------------------------------------------------------
-  // 1. RESEARCH — Google Search ENABLED (Flash — high-volume structured extraction)
-  //
-  // For Begility, we care about operational signals: team size, tech stack
-  // hints (CRM / booking / scheduling / case-management software references),
-  // and observable process pain (manual booking, phone-only contact, no
-  // online booking, no live chat, outdated site, missing CRM, etc.).
-  // -------------------------------------------------------------------------
-  async runResearch(businessName: string, city?: string): Promise<ResearchResult> {
+  async runResearch(businessName: string, city?: string, websiteUrl?: string): Promise<ResearchResult> {
     const config = getNicheConfig();
     const locationHint = city ? ` located in ${city}` : "";
+    
+    // Inject the known URL into the prompt
+    const websiteHint = websiteUrl ? `\nTheir known website is ${websiteUrl}. Start by searching this site directly to find their contact details and operational signals.` : "";
 
     return this.callGemini<ResearchResult>({
       label: `research:${businessName}`,
       systemPrompt:
         "You are a B2B operations researcher working for an AI consultancy that only sells to businesses with visible operational drag. You search the web and return valid JSON only — no preamble, no markdown.",
-      userPrompt: `Search Google for the ${config.nicheTag} called '${businessName}'${locationHint}.
+      // Pass the website hint to the AI
+      userPrompt: `Search Google for the ${config.nicheTag} called '${businessName}'${locationHint}.${websiteHint}
 
 Return a single JSON object with these exact keys:
 
@@ -165,7 +161,7 @@ Return a single JSON object with these exact keys:
 Return ONLY the JSON object. No markdown. No preamble.`,
       temperature: 0.1,
       maxTokens: 4096,
-      enableSearch: true,
+      enableSearch: true, 
       thinkingBudget: 2048,
     });
   }
