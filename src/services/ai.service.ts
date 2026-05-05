@@ -165,7 +165,7 @@ Return a single JSON object with these exact keys:
 Return ONLY the JSON object. No markdown. No preamble.`,
       temperature: 0.1,
       maxTokens: 4096,
-      enableSearch: true,
+      enableSearch: false,
       thinkingBudget: 2048,
     });
   }
