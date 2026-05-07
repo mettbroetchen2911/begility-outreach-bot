@@ -45,6 +45,15 @@ interface SweepState {
   startTime: number;
 }
 
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 function shouldStop(s: SweepState): StopReason | null {
   if (s.totalNew >= TARGET_NEW) return "target_hit";
   if (s.attempts >= MAX_ATTEMPTS) return "attempts_exhausted";
@@ -369,26 +378,33 @@ export async function runDiscoverySweep() {
   console.log(`  Fallback: Google Places — ${USE_PLACES_FALLBACK ? "ENABLED" : "DISABLED"}`);
   console.log(`  Website validation: ${VALIDATE_WEBSITES ? "ENABLED" : "DISABLED"}`);
 
-  // ── Phase 1: Companies House across all configured locations ──
   if (sicCodes.length === 0 || locations.length === 0) {
-    console.warn("  Skipping CH phase — COMPANIES_HOUSE_SIC_CODES or COMPANIES_HOUSE_LOCATIONS unset");
-  } else {
-    phase1: for (const location of locations) {
-      await scanCompaniesHouse(location, sicCodes, incorporatedBefore, state);
-      if (shouldStop(state)) break phase1;
-    }
-  }
+  console.warn("  Skipping CH phase — COMPANIES_HOUSE_SIC_CODES or COMPANIES_HOUSE_LOCATIONS unset");
+} else {
+  const pairs = locations.flatMap((location) =>
+    sicCodes.map((sic) => ({ location, sic }))
+  );
+  const shuffledPairs = shuffle(pairs);
+  console.log(`  CH plan: ${shuffledPairs.length} (location × SIC) pairs, randomised`);
 
-  // ── Phase 2: Google Places fallback for sole traders / partnerships ──
-  if (USE_PLACES_FALLBACK && !shouldStop(state)) {
-    console.log(`Phase 2: ${state.totalNew}/${TARGET_NEW} — Places fallback`);
-    phase2: for (const query of config.discoveryQueries) {
-      for (const region of config.discoveryRegions) {
-        await scanPlaces(query, region, state);
-        if (shouldStop(state)) break phase2;
-      }
-    }
+  phase1: for (const { location, sic } of shuffledPairs) {
+    await scanCompaniesHouse(location, [sic], incorporatedBefore, state);
+    if (shouldStop(state)) break phase1;
   }
+}
+
+  if (USE_PLACES_FALLBACK && !shouldStop(state)) {
+  console.log(`Phase 2: ${state.totalNew}/${TARGET_NEW} — Places fallback`);
+  const placesPairs = shuffle(
+    config.discoveryQueries.flatMap((query) =>
+      config.discoveryRegions.map((region) => ({ query, region }))
+    )
+  );
+  phase2: for (const { query, region } of placesPairs) {
+    await scanPlaces(query, region, state);
+    if (shouldStop(state)) break phase2;
+  }
+}
 
   const stopReason = shouldStop(state) ?? "completed";
   const durationMin = Math.round((Date.now() - state.startTime) / 60_000);
