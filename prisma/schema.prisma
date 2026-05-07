@@ -180,6 +180,9 @@ model Lead {
 
   scrapeAttempts        Int       @default(0)
 
+  researchFailureCount  Int       @default(0)
+  lastResearchAttemptAt DateTime?
+
   emailVerified     Boolean   @default(false)
   emailVerifiedAt   DateTime?
   mxValid           Boolean?
