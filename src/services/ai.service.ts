@@ -5,18 +5,8 @@ import {
   getEmailSignature,
 } from "../config/niche.js";
 import { withRetry } from "../utils/retry.js";
+import { geminiBreaker } from "../utils/circuit-breaker.js";
 import { callClaudeSonnetJson } from "../utils/bedrock.js";
-
-// ---------------------------------------------------------------------------
-// Model routing
-//   - Pro / quality-sensitive calls (brand-fit scoring) → Claude Sonnet on AWS Bedrock
-//   - Flash / high-volume calls (research, sentiment, follow-up, goodbye)
-//     → Gemini 2.5 Flash
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface ResearchResult {
   owner_name: string | null;
@@ -92,54 +82,66 @@ export class AIService {
   }): Promise<T> {
     const tools = opts.enableSearch ? [{ googleSearch: {} }] : undefined;
 
+    if (geminiBreaker.isOpen()) {
+      throw new Error(`Gemini circuit open — skipping ${opts.label}`);
+    }
+
     return withRetry(
       async () => {
-        const response = await this.client.models.generateContent({
-          model: this.model,
-          contents: [{ role: "user", parts: [{ text: opts.userPrompt }] }],
-          config: {
-            systemInstruction: opts.systemPrompt,
-            temperature: opts.temperature,
-            maxOutputTokens: opts.maxTokens,
-            tools,
-            ...(opts.thinkingBudget != null && {
-              thinkingConfig: { thinkingBudget: opts.thinkingBudget },
-            }),
-          },
-        });
-
-        const rawText = response.text ?? "";
-        const cleaned = rawText
-          .replace(/^```(?:json)?\n?/g, "")
-          .replace(/\n?```$/g, "")
-          .trim();
-
         try {
-          return JSON.parse(cleaned) as T;
+          const response = await this.client.models.generateContent({
+            model: this.model,
+            contents: [{ role: "user", parts: [{ text: opts.userPrompt }] }],
+            config: {
+              systemInstruction: opts.systemPrompt,
+              temperature: opts.temperature,
+              maxOutputTokens: opts.maxTokens,
+              tools,
+              ...(opts.thinkingBudget != null && {
+                thinkingConfig: { thinkingBudget: opts.thinkingBudget },
+              }),
+            },
+          });
+
+          const rawText = response.text ?? "";
+          const cleaned = rawText
+            .replace(/^```(?:json)?\n?/g, "")
+            .replace(/\n?```$/g, "")
+            .trim();
+
+          try {
+            const parsed = JSON.parse(cleaned) as T;
+            geminiBreaker.recordSuccess();
+            return parsed;
+          } catch (err) {
+            throw new Error(
+              `Gemini Flash returned unparseable JSON for ${opts.label}.\n` +
+                `Raw (first 500): ${rawText.slice(0, 500)}\nError: ${err}`
+            );
+          }
         } catch (err) {
-          throw new Error(
-            `Gemini Flash returned unparseable JSON for ${opts.label}.\n` +
-              `Raw (first 500): ${rawText.slice(0, 500)}\nError: ${err}`
-          );
+          const msg = err instanceof Error ? err.message.toLowerCase() : "";
+          if (/\b(429|500|502|503|504)\b/.test(msg) || msg.includes("resource exhausted") || msg.includes("throttled")) {
+            geminiBreaker.recordFailure();
+          }
+          throw err;
         }
       },
       opts.label,
-      { maxAttempts: 5, baseDelayMs: 5000 }
+      { maxAttempts: 5, baseDelayMs: 5000, maxDelayMs: 30_000 },
     );
   }
 
   async runResearch(businessName: string, city?: string, websiteUrl?: string): Promise<ResearchResult> {
     const config = getNicheConfig();
     const locationHint = city ? ` located in ${city}` : "";
-    
-    // Inject the known URL into the prompt
+
     const websiteHint = websiteUrl ? `\nTheir known website is ${websiteUrl}. Start by searching this site directly to find their contact details and operational signals.` : "";
 
     return this.callGemini<ResearchResult>({
       label: `research:${businessName}`,
       systemPrompt:
         "You are a B2B operations researcher working for an AI consultancy that only sells to businesses with visible operational drag. You search the web and return valid JSON only — no preamble, no markdown.",
-      // Pass the website hint to the AI
       userPrompt: `Search Google for the ${config.nicheTag} called '${businessName}'${locationHint}.${websiteHint}
 
 Return a single JSON object with these exact keys:
