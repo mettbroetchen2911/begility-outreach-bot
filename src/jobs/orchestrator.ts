@@ -71,18 +71,29 @@ if (recovered.count > 0) {
 }
 
 const now = new Date();
+const RESEARCH_RETRY_BACKOFF_HOURS = 6;
+const RESEARCH_MAX_FAILURES = 3;
+const researchBackoffCutoff = new Date(now.getTime() - RESEARCH_RETRY_BACKOFF_HOURS * 3600_000);
+
 const leads = await prisma.lead.findMany({
   where: {
     status: "new_lead",
     enrichmentLock: false,
-    // Send-window gate: process if no window or window has opened.
+    // Send-window gate
     OR: [
       { nextOutreachWindow: null },
       { nextOutreachWindow: { lte: now } },
     ],
+    AND: [
+      { researchFailureCount: { lt: RESEARCH_MAX_FAILURES } },
+      {
+        OR: [
+          { lastResearchAttemptAt: null },
+          { lastResearchAttemptAt: { lte: researchBackoffCutoff } },
+        ],
+      },
+    ],
   },
-  // Tier 3 ranking: highest CH pre-score first, then oldest discovery date.
-  // Leads with no pre-score sort last (treated as 0).
   orderBy: [
     { chPreScore: { sort: "desc", nulls: "last" } },
     { createdAt: "asc" },
@@ -120,14 +131,53 @@ for (const lead of leads) {
 console.log(`\n[${lead.businessName}]${lead.chPreScore != null ? ` chPreScore=${lead.chPreScore}` : ""}`);
       
 console.log("  [1/8] Researching...");
-const research = await withLeadTimeout(
-  ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
-  PER_LEAD_TIMEOUT_MS,
-  `research:${lead.businessName}`,
-);
+let research: Awaited<ReturnType<typeof ai.runResearch>>;
+try {
+  research = await withLeadTimeout(
+    ai.runResearch(lead.businessName, lead.city ?? "", lead.websiteUrl ?? undefined),
+    PER_LEAD_TIMEOUT_MS,
+    `research:${lead.businessName}`,
+  );
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  const newCount = (lead.researchFailureCount ?? 0) + 1;
+  const willGiveUp = newCount >= RESEARCH_MAX_FAILURES;
+
+  console.warn(
+    `  Research failed (attempt ${newCount}/${RESEARCH_MAX_FAILURES}): ${msg.slice(0, 160)}` +
+    (willGiveUp ? " — flagging for manual review" : " — will retry next sweep"),
+  );
+
+  await prisma.lead.update({
+    where: { id: lead.id },
+    data: {
+      researchFailureCount: newCount,
+      lastResearchAttemptAt: new Date(),
+      enrichmentLock: false,
+      enrichmentLockedAt: null,
+      status: willGiveUp ? "needs_review" : "new_lead",
+      notes: willGiveUp
+        ? `Research failed ${newCount} times. Last error: ${msg.slice(0, 240)}`
+        : lead.notes,
+    },
+  });
+
+  results.push({
+    leadId: lead.id,
+    businessName: lead.businessName,
+    outcome: willGiveUp ? "research_failed_max_retries" : "research_failed_will_retry",
+  });
+  continue;
+}
+
+if ((lead.researchFailureCount ?? 0) > 0) {
+  await prisma.lead.update({
+    where: { id: lead.id },
+    data: { researchFailureCount: 0, lastResearchAttemptAt: new Date() },
+  });
+}
 
 const authoritativeOwner = lead.ownerName;
-
 const resolvedWebsite = research.website ?? lead.websiteUrl ?? null;
 
 let scrape: Awaited<ReturnType<typeof scrapeBusinessWebsiteV2>> | null = null;
