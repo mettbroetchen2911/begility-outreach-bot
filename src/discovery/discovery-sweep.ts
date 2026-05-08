@@ -23,7 +23,7 @@ const VALIDATE_WEBSITES = (process.env.VALIDATE_WEBSITES ?? "true").toLowerCase(
 const USE_PLACES_FALLBACK = (process.env.DISCOVERY_USE_PLACES_FALLBACK ?? "true").toLowerCase() === "true";
 const MAX_CONSECUTIVE_ZERO_YIELD = parseInt(process.env.CH_MAX_CONSECUTIVE_ZERO_YIELD ?? "3", 10);
 
-type StopReason = "target_hit" | "attempts_exhausted" | "timeout" | "no_progress";
+type StopReason = "target_hit" | "attempts_exhausted" | "timeout" | "no_progress" | "consecutive_zero_yield";
 interface SweepState {
   totalNew: number;
   totalDiscovered: number;
