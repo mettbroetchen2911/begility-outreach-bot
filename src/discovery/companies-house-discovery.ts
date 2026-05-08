@@ -58,13 +58,20 @@ export interface CHDiscoveryResult {
   businesses: CHDiscoveredBusiness[];
   location: string;
   totalSearched: number;
-  rejectedFinancialStanding: number;
+
+  rejectedProfileFetchFailed: number;
+  rejectedDormant: number;
+  rejectedInsolvency: number;
+  rejectedOverdue: number;
+  rejectedAccountsCategory: number;   // micro-entity exclusion lands here
+  rejectedNoAccountsCategory: number;
+  rejectedStatusInactive: number;
+  rejectedHardExclude: number;        // post-enrichment summariseCh hard-exclude
   rejectedPreScore: number;
   rejectedNomineeAddress: number;
-  rejectedDormant: number;
   flaggedSubsidiary: number;
+  rejectedFinancialStanding: number;  // sum of: profile-fetch, dormant, insolvency, overdue, accounts-category, no-accounts-category, status-inactive, hard-exclude
 }
-
 const PAGE_SIZE = 100;
 const MAX_PAGES = parseInt(process.env.CH_MAX_PAGES_PER_LOCATION ?? "5", 10);
 const ENRICH_AT_DISCOVERY = (process.env.CH_ENRICH_AT_DISCOVERY ?? "true").toLowerCase() === "true";
@@ -97,11 +104,18 @@ export async function discoverFromCompaniesHouse(opts: {
     businesses: [],
     location: opts.location,
     totalSearched: 0,
-    rejectedFinancialStanding: 0,
+    rejectedProfileFetchFailed: 0,
+    rejectedDormant: 0,
+    rejectedInsolvency: 0,
+    rejectedOverdue: 0,
+    rejectedAccountsCategory: 0,
+    rejectedNoAccountsCategory: 0,
+    rejectedStatusInactive: 0,
+    rejectedHardExclude: 0,
     rejectedPreScore: 0,
     rejectedNomineeAddress: 0,
-    rejectedDormant: 0,
     flaggedSubsidiary: 0,
+    rejectedFinancialStanding: 0,
   };
 
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -120,21 +134,24 @@ export async function discoverFromCompaniesHouse(opts: {
     result.totalSearched += hits.length;
     if (hits.length === 0) break;
 
-    for (const hit of hits) {
-      const enriched = await assessHit(hit);
-      if (!enriched) {
-        result.rejectedFinancialStanding++;
+for (const hit of hits) {
+      const outcome = await assessHit(hit);
+      if (outcome.kind === "rejected") {
+        switch (outcome.reason) {
+          case "profile-fetch-failed":  result.rejectedProfileFetchFailed++; break;
+          case "dormant":               result.rejectedDormant++; break;
+          case "insolvency":            result.rejectedInsolvency++; break;
+          case "overdue":               result.rejectedOverdue++; break;
+          case "accounts-category":     result.rejectedAccountsCategory++; break;
+          case "no-accounts-category":  result.rejectedNoAccountsCategory++; break;
+          case "status-inactive":       result.rejectedStatusInactive++; break;
+          case "hard-exclude":          result.rejectedHardExclude++; break;
+        }
+        result.rejectedFinancialStanding++;  // keep aggregate in sync
         continue;
       }
-      // Tier-5: rejected because last_accounts.type was DORMANT/AA02 etc.
-      // assessFinancialStanding() rolls this into rejectedFinancialStanding,
-      // but we surface the dormant subset separately when it's the only reason.
-      if (enriched.lastAccountsType && /DORMANT|AA02/i.test(enriched.lastAccountsType)) {
-        // never reaches here because assessHit already returned null for dormant
-        // — kept defensive in case of taxonomy change.
-        result.rejectedDormant++;
-        continue;
-      }
+      const enriched = outcome.business;
+
       if (enriched.nomineeAddress && REJECT_NOMINEE_ADDRESS) {
         result.rejectedNomineeAddress++;
         continue;
@@ -145,7 +162,6 @@ export async function discoverFromCompaniesHouse(opts: {
       }
       if (enriched.subsidiaryOfLeadId) {
         result.flaggedSubsidiary++;
-        // fall through — let it persist with the parent flag
       }
       if (enriched.signals && enriched.signals.preScore < PRE_SCORE_FLOOR) {
         result.rejectedPreScore++;
@@ -160,15 +176,38 @@ export async function discoverFromCompaniesHouse(opts: {
   return result;
 }
 
-async function assessHit(hit: CompanySearchHit): Promise<CHDiscoveredBusiness | null> {
-  const profile = await getCompanyProfile(hit.company_number);
-  if (!profile) return null;
+type AssessRejection =
+  | "profile-fetch-failed"
+  | "dormant"
+  | "insolvency"
+  | "overdue"
+  | "accounts-category"
+  | "no-accounts-category"
+  | "status-inactive"
+  | "hard-exclude";
 
-  // Tier-5: dormant filers fail the standing check via assessFinancialStanding.
-  if (isDormantFiler(profile)) return null;
+type AssessOutcome =
+  | { kind: "ok"; business: CHDiscoveredBusiness }
+  | { kind: "rejected"; reason: AssessRejection };
+
+async function assessHit(hit: CompanySearchHit): Promise<AssessOutcome> {
+  const profile = await getCompanyProfile(hit.company_number);
+  if (!profile) return { kind: "rejected", reason: "profile-fetch-failed" };
+
+  if (isDormantFiler(profile)) return { kind: "rejected", reason: "dormant" };
 
   const standing = assessFinancialStanding(profile);
-  if (!standing.passes) return null;
+  if (!standing.passes) {
+    const r = standing.reason ?? "";
+    if (r.startsWith("status="))                return { kind: "rejected", reason: "status-inactive" };
+    if (r === "insolvency-history")             return { kind: "rejected", reason: "insolvency" };
+    if (r === "accounts-overdue")               return { kind: "rejected", reason: "overdue" };
+    if (r === "confirmation-statement-overdue") return { kind: "rejected", reason: "overdue" };
+    if (r.startsWith("last-accounts-type"))     return { kind: "rejected", reason: "dormant" };
+    if (r === "no-accounts-category")           return { kind: "rejected", reason: "no-accounts-category" };
+    if (r.startsWith("accounts-category="))     return { kind: "rejected", reason: "accounts-category" };
+    return { kind: "rejected", reason: "hard-exclude" };
+  }
 
   const addr = profile.registered_office_address ?? hit.registered_office_address;
   const fullAddress = addr
@@ -207,11 +246,8 @@ async function assessHit(hit: CompanySearchHit): Promise<CHDiscoveredBusiness | 
     recentNameChangeCount: null,
   };
 
-  if (!ENRICH_AT_DISCOVERY) return base;
-
-  // Short-circuit: nominee-addressed companies aren't worth enriching when
-  // we're going to reject them anyway. Skip the API spend.
-  if (nominee && REJECT_NOMINEE_ADDRESS) return base;
+  if (!ENRICH_AT_DISCOVERY) return { kind: "ok", business: base };
+  if (nominee && REJECT_NOMINEE_ADDRESS) return { kind: "ok", business: base };
 
   // ── Enrichment: officers / filings / charges / PSC / accounts ──
   const [officers, filings, charges, psc] = await Promise.all([
@@ -227,7 +263,7 @@ async function assessHit(hit: CompanySearchHit): Promise<CHDiscoveredBusiness | 
   }
 
   const signals = summariseCh({ profile, officers, filings, charges, psc, accounts });
-  if (signals.hardExclude) return null;
+  if (signals.hardExclude) return { kind: "rejected", reason: "hard-exclude" };
 
   // Persist parsed financials separately (keyed by company number) for re-use
   await persistCompanyFinancials(profile.company_number, accounts).catch(() => { /* best-effort */ });
@@ -277,15 +313,18 @@ async function assessHit(hit: CompanySearchHit): Promise<CHDiscoveredBusiness | 
   });
 
   return {
-    ...base,
-    ownerName: signals.primaryDirectorName,
-    signals,
-    accounts,
-    nextOutreachWindow: window?.at ?? null,
-    nextOutreachWindowReason: window?.reason ?? null,
-    subsidiaryOfLeadId,
-    corporatePscCount: corporatePsc.active || null,
-    recentNameChangeCount: recentNameChanges || null,
+    kind: "ok",
+    business: {
+      ...base,
+      ownerName: signals.primaryDirectorName,
+      signals,
+      accounts,
+      nextOutreachWindow: window?.at ?? null,
+      nextOutreachWindowReason: window?.reason ?? null,
+      subsidiaryOfLeadId,
+      corporatePscCount: corporatePsc.active || null,
+      recentNameChangeCount: recentNameChanges || null,
+    },
   };
 }
 
