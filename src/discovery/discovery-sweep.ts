@@ -21,9 +21,9 @@ const MAX_RUNTIME_MS = parseInt(process.env.DISCOVERY_MAX_RUNTIME_MS ?? "1500000
 const SCAN_COOLDOWN_HOURS = parseInt(process.env.SCAN_COOLDOWN_HOURS ?? "48", 10);
 const VALIDATE_WEBSITES = (process.env.VALIDATE_WEBSITES ?? "true").toLowerCase() === "true";
 const USE_PLACES_FALLBACK = (process.env.DISCOVERY_USE_PLACES_FALLBACK ?? "true").toLowerCase() === "true";
+const MAX_CONSECUTIVE_ZERO_YIELD = parseInt(process.env.CH_MAX_CONSECUTIVE_ZERO_YIELD ?? "3", 10);
 
 type StopReason = "target_hit" | "attempts_exhausted" | "timeout" | "no_progress";
-
 interface SweepState {
   totalNew: number;
   totalDiscovered: number;
@@ -31,9 +31,20 @@ interface SweepState {
   totalSkipped: number;
   totalInvalidWebsites: number;
   totalRejectedFinancialStanding: number;
+  totalRejectedProfileFetchFailed: number;
+  totalRejectedDormant: number;
+  totalRejectedInsolvency: number;
+  totalRejectedOverdue: number;
+  totalRejectedAccountsCategory: number;
+  totalRejectedNoAccountsCategory: number;
+  totalRejectedStatusInactive: number;
+  totalRejectedHardExclude: number;
+
   totalRejectedPreScore: number;
   totalRejectedNomineeAddress: number;
   totalFlaggedSubsidiary: number;
+
+  consecutiveZeroYieldScans: number;
   attempts: number;
   runs: Array<{
     source: string;
@@ -58,12 +69,9 @@ function shouldStop(s: SweepState): StopReason | null {
   if (s.totalNew >= TARGET_NEW) return "target_hit";
   if (s.attempts >= MAX_ATTEMPTS) return "attempts_exhausted";
   if (Date.now() - s.startTime >= MAX_RUNTIME_MS) return "timeout";
+  if (s.consecutiveZeroYieldScans >= MAX_CONSECUTIVE_ZERO_YIELD) return "consecutive_zero_yield";
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// Companies House scan (primary)
-// ---------------------------------------------------------------------------
 
 async function scanCompaniesHouse(
   location: string,
@@ -98,15 +106,25 @@ async function scanCompaniesHouse(
     const result = await discoverFromCompaniesHouse({ location, sicCodes, incorporatedBefore });
     state.totalDiscovered += result.businesses.length;
     state.totalRejectedFinancialStanding += result.rejectedFinancialStanding;
+    state.totalRejectedProfileFetchFailed += result.rejectedProfileFetchFailed;
+    state.totalRejectedDormant += result.rejectedDormant;
+    state.totalRejectedInsolvency += result.rejectedInsolvency;
+    state.totalRejectedOverdue += result.rejectedOverdue;
+    state.totalRejectedAccountsCategory += result.rejectedAccountsCategory;
+    state.totalRejectedNoAccountsCategory += result.rejectedNoAccountsCategory;
+    state.totalRejectedStatusInactive += result.rejectedStatusInactive;
+    state.totalRejectedHardExclude += result.rejectedHardExclude;
     state.totalRejectedPreScore += result.rejectedPreScore;
     state.totalRejectedNomineeAddress += result.rejectedNomineeAddress;
     state.totalFlaggedSubsidiary += result.flaggedSubsidiary;
     console.log(
-      `    CH found ${result.businesses.length} qualifying businesses ` +
-      `(${result.rejectedFinancialStanding} rejected financial-standing, ` +
-      `${result.rejectedPreScore} below pre-score floor, ` +
-      `${result.rejectedNomineeAddress} nominee-address, ` +
-      `${result.flaggedSubsidiary} subsidiary-flagged)`,
+      `    CH found ${result.businesses.length} qualifying ` +
+      `(rejected: profile-fetch=${result.rejectedProfileFetchFailed}, ` +
+      `dormant=${result.rejectedDormant}, insolvency=${result.rejectedInsolvency}, ` +
+      `overdue=${result.rejectedOverdue}, accounts-cat=${result.rejectedAccountsCategory}, ` +
+      `no-accounts-cat=${result.rejectedNoAccountsCategory}, status=${result.rejectedStatusInactive}, ` +
+      `hard-exclude=${result.rejectedHardExclude}, pre-score=${result.rejectedPreScore}, ` +
+      `nominee=${result.rejectedNomineeAddress}, subsidiary-flagged=${result.flaggedSubsidiary})`,
     );
 
     for (const biz of result.businesses) {
@@ -235,7 +253,16 @@ async function scanCompaniesHouse(
     }).catch(() => { /* best-effort */ });
 
     state.runs.push({ source: "companies_house", location, discovered: result.businesses.length, new: scanNew });
-    console.log(`    → ${scanNew} new, ${scanDuplicates} dupes (${Date.now() - start}ms) | running total ${state.totalNew}/${TARGET_NEW}`);
+    if (scanNew === 0) {
+      state.consecutiveZeroYieldScans++;
+    } else {
+      state.consecutiveZeroYieldScans = 0;
+    }
+    console.log(
+      `    → ${scanNew} new, ${scanDuplicates} dupes (${Date.now() - start}ms) | ` +
+      `running total ${state.totalNew}/${TARGET_NEW}` +
+      (state.consecutiveZeroYieldScans > 0 ? ` | zero-yield streak: ${state.consecutiveZeroYieldScans}/${MAX_CONSECUTIVE_ZERO_YIELD}` : "")
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`    CH scan failed: ${msg}`);
@@ -357,10 +384,20 @@ export async function runDiscoverySweep() {
   const config = getNicheConfig();
   const state: SweepState = {
     totalNew: 0, totalDiscovered: 0, totalDuplicates: 0,
-    totalSkipped: 0, totalInvalidWebsites: 0, totalRejectedFinancialStanding: 0,
+    totalSkipped: 0, totalInvalidWebsites: 0,
+    totalRejectedFinancialStanding: 0,
+    totalRejectedProfileFetchFailed: 0,
+    totalRejectedDormant: 0,
+    totalRejectedInsolvency: 0,
+    totalRejectedOverdue: 0,
+    totalRejectedAccountsCategory: 0,
+    totalRejectedNoAccountsCategory: 0,
+    totalRejectedStatusInactive: 0,
+    totalRejectedHardExclude: 0,
     totalRejectedPreScore: 0,
     totalRejectedNomineeAddress: 0,
     totalFlaggedSubsidiary: 0,
+    consecutiveZeroYieldScans: 0,
     attempts: 0, runs: [], startTime: Date.now(),
   };
 
@@ -381,14 +418,11 @@ export async function runDiscoverySweep() {
   if (sicCodes.length === 0 || locations.length === 0) {
   console.warn("  Skipping CH phase — COMPANIES_HOUSE_SIC_CODES or COMPANIES_HOUSE_LOCATIONS unset");
 } else {
-  const pairs = locations.flatMap((location) =>
-    sicCodes.map((sic) => ({ location, sic }))
-  );
-  const shuffledPairs = shuffle(pairs);
-  console.log(`  CH plan: ${shuffledPairs.length} (location × SIC) pairs, randomised`);
+  const shuffledLocations = shuffle(locations);
+  console.log(`  CH plan: ${shuffledLocations.length} locations × ${sicCodes.length} SICs (batched), randomised location order`);
 
-  phase1: for (const { location, sic } of shuffledPairs) {
-    await scanCompaniesHouse(location, [sic], incorporatedBefore, state);
+  phase1: for (const location of shuffledLocations) {
+    await scanCompaniesHouse(location, shuffle(sicCodes), incorporatedBefore, state);
     if (shouldStop(state)) break phase1;
   }
 }
@@ -413,8 +447,20 @@ export async function runDiscoverySweep() {
     `Discovery sweep complete: ${state.totalNew} new, ` +
     `${state.totalDuplicates} duplicates, ${state.totalSkipped} skipped, ` +
     `${state.totalInvalidWebsites} invalid sites, ` +
-    `${state.totalRejectedFinancialStanding} rejected on financial standing, ` +
     `${state.attempts} attempts, ${durationMin}min, stop=${stopReason}`
+  );
+  console.log(
+    `  Rejection breakdown: ` +
+    `profile-fetch=${state.totalRejectedProfileFetchFailed}, ` +
+    `dormant=${state.totalRejectedDormant}, ` +
+    `insolvency=${state.totalRejectedInsolvency}, ` +
+    `overdue=${state.totalRejectedOverdue}, ` +
+    `accounts-cat=${state.totalRejectedAccountsCategory}, ` +
+    `no-accounts-cat=${state.totalRejectedNoAccountsCategory}, ` +
+    `status=${state.totalRejectedStatusInactive}, ` +
+    `hard-exclude=${state.totalRejectedHardExclude}, ` +
+    `pre-score=${state.totalRejectedPreScore}, ` +
+    `nominee=${state.totalRejectedNomineeAddress}`
   );
 
   return {
