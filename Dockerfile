@@ -25,6 +25,8 @@ COPY --from=builder /app/prisma ./prisma
 
 COPY --from=builder /app/dist ./dist
 
+COPY assets ./assets
+
 USER app
 
 ENV NODE_ENV=production
