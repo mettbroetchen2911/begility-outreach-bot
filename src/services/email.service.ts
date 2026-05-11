@@ -2,6 +2,15 @@ import { withRetry } from "../utils/retry.js";
 import { wrapEmailInTemplate } from "../utils/email-template.js";
 import { ensureHtml } from "../utils/text-utils.js";
 import { prisma } from "../utils/prisma.js";
+import {
+  logoBase64,
+  pdfBase64,
+  LOGO_CID,
+  LOGO_FILENAME,
+  LOGO_CONTENT_TYPE,
+  PDF_FILENAME,
+  PDF_CONTENT_TYPE,
+} from "../utils/email-assets.js";
 
 export interface DraftResult {
   messageId: string;
@@ -47,7 +56,7 @@ export class EmailService {
 
       const suppressed = await prisma.suppression.findUnique({ where: { email: to.toLowerCase() } });
       if (suppressed) throw new Error(`Email ${to} is suppressed — aborting draft`);
-      
+
       const formattedHtml = wrapEmailInTemplate(ensureHtml(html));
 
       const res = await fetch(
@@ -57,9 +66,26 @@ export class EmailService {
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             subject,
-            body: { contentType: "HTML", content: formattedHtml }, // Use formattedHtml
+            body: { contentType: "HTML", content: formattedHtml },
             toRecipients: [{ emailAddress: { address: to } }],
             isDraft: true,
+            attachments: [
+              {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                name: LOGO_FILENAME,
+                contentType: LOGO_CONTENT_TYPE,
+                contentBytes: logoBase64,
+                contentId: LOGO_CID,
+                isInline: true,
+              },
+              {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                name: PDF_FILENAME,
+                contentType: PDF_CONTENT_TYPE,
+                contentBytes: pdfBase64,
+                isInline: false,
+              },
+            ],
           }),
         }
       );
