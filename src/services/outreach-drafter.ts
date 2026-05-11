@@ -7,10 +7,6 @@ import { getConfig } from "./runtime-config.service.js";
 import type { ScrapedDataV2 } from "./website-scraper-v2.js";
 import { callClaudeSonnetJson } from "../utils/bedrock.js";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 export interface DraftContext {
   businessName: string;
   ownerName: string | null;
@@ -48,10 +44,6 @@ export interface DraftResult {
   was_retried: boolean;
   warnings: string[];
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 export async function draftOutreachEmail(ctx: DraftContext): Promise<DraftResult> {
   const wordMin = await getConfig<number>("OUTREACH_WORD_MIN").catch(() => 110);
@@ -102,10 +94,6 @@ export async function draftOutreachEmail(ctx: DraftContext): Promise<DraftResult
     warnings,
   };
 }
-
-// ---------------------------------------------------------------------------
-// Prompt construction — Claude Sonnet on Bedrock
-// ---------------------------------------------------------------------------
 
 async function callClaude(
   ctx: DraftContext,
@@ -166,7 +154,9 @@ This email has exactly FOUR short paragraphs. It is specific, short, and operato
 PARA 1 — WARM OPENING + "WHY THEM" (1-2 sentences)
 - Use the exact greeting above.
 - One sentence acknowledging this is out of the blue (dry, not apologetic).
-- Name ONE concrete thing from the research that caught your eye — their positioning, team size, a specific service line, a specific signal. Must feel like you actually looked, not like a mail-merge field. No generic compliments ("great website", "impressive team") — those are banned.
+- Name ONE concrete fact or observable signal from the research — headcount or office count from Companies House, a tech tell (booking platform, CRM, no online booking, phone-only contact), an operational signal (single shared inbox, three locations, blog last touched in 2022), a recent director appointment, a turnover band, an anniversary year. The reference must be a FACT, not a paraphrase of their marketing copy.
+- BANNED in this paragraph: anything that rewords the business's own About/Services page back at them — "your focus on X", "your commitment to Y", "your reputation for Z", "I can see you specialise in...", "your expertise in...". If the sentence could plausibly have been lifted from their homepage, cut it and lean harder on para 2 instead.
+- No generic compliments ("great website", "impressive team") — also banned.
 
 PARA 2 — THE OBSERVED PAIN (2-3 sentences — THE HEART OF THE EMAIL)
 - Based on the primary_pain_hypothesis and research, describe the specific operational friction you'd expect to see in a business like theirs, framed as an observation from the outside. Examples of the texture (do not copy, adapt):
@@ -179,12 +169,13 @@ PARA 2 — THE OBSERVED PAIN (2-3 sentences — THE HEART OF THE EMAIL)
 
 PARA 3 — WHO WE ARE + THE ASK (2-3 sentences)
 - The FIRST time ${config.brandName} is written in this paragraph, write it as: ${config.brandName} (${website}). Only once across the whole email. Never repeat the URL.
-- One sentence on what we do — NOT as a pitch. E.g.: "We're a small UK outfit that helps founder-led businesses strip operational drag out of the back-office — AI and automation as the tool, tighter operations as the actual product." Adapt; do not copy.
-- Critically — the ASK is a question, not a meeting. Invite them to tell us what THEIR single biggest operational drag is right now. Use one of these textures (adapt; do not copy):
-   * "Worth a two-line reply — what's the one operational thing that, if it ran itself by the end of the quarter, would give you the most breathing room?"
-   * "Rather than send over a generic overview: what's the bit of your day-to-day right now that's costing you the most time or the most revenue?"
-   * "Happy to send over how we'd think about it — but first, what's the bit that's currently eating the most of your week?"
-- The question must feel genuinely curious, not a thinly-disguised sales trap. We actually want to hear the answer.
+- One sentence on what we do. We BUILD AI infrastructure for founder-led UK businesses — actual systems that take specific jobs off people's plates. We do NOT do advisory work, strategy decks, or "help with" anything. Concrete examples of the texture (adapt; do not copy): "We build AI infrastructure for UK SMEs — the systems that handle lead intake, follow-up chases, and the weekly reporting someone currently rebuilds by hand." / "We build the AI plumbing that runs the bits of the back-office that currently depend on someone remembering."
+- Allowed verbs for THIS sentence: build, run, ship, deploy. BANNED verbs for THIS sentence: help, support, enable, transform, optimise, strip, unlock, empower, streamline.
+- The ASK is ONE question with TWO low-friction routes to answer: a short email reply OR 10 minutes on a call, their choice. The question is primary; the call is the alternative for people who'd rather talk than type. Never ask only for the call. Use one of these textures (adapt; do not copy):
+   * "Worth a two-line reply — or 10 minutes on a call if that's easier — what's the one operational thing that, if it ran itself by the end of the quarter, would give you the most breathing room?"
+   * "Rather than send over a generic overview: what's the bit of your day-to-day right now that's costing you the most time or revenue? Happy to swap a reply for a 10-minute call if that suits better."
+   * "What's the bit that's currently eating the most of your week? Two lines back or 10 minutes on a call, whichever's less effort."
+- The question must feel genuinely curious, not a thinly-disguised sales trap. We actually want to hear the answer. Never use the phrase "pain points".
 
 PARA 4 — SIGN-OFF
 - Single line: <p>${signature}</p>
@@ -195,7 +186,8 @@ HARD RULES
 - Tone: ${opts.tone}
 - ${opts.wordMin}-${opts.wordMax} words in the body (excluding greeting and sign-off).
 - Subject line: ≤ ${subjectMax} chars, specific to THIS business — reference their sector, a specific signal, or the pain lens. Never "A quick question" or "Partnership opportunity" or anything generic.
-- Write in plain English. No consulting voice. No buzzwords. No "leverage", "synergy", "unlock value", "digital transformation", "AI journey", "at scale", "best-in-class", "end-to-end", "holistic", "seamless".
+- NO prescriptive or moralising language about their business. BANNED: "businesses like yours shouldn't be experiencing this", "you shouldn't have to", "firms your size deserve better", "no [sector] business should be...", "it's unacceptable that...", "there's no reason you should...". You have not been inside their company. You are not in a position to tell them what they should or shouldn't be experiencing.
+- NO "pain points" — anywhere. Consultant register. Use "drag", "leak", "friction", "bottleneck", "the bit that goes first" when describing THEIR situation. Never use "drag" / "friction" / "leak" to describe what WE sell — those are for para 2 only.
 - NO em-dashes (—), en-dashes (–), or curly quotes. Use commas, full stops, straight quotes.
 - NO bullet points, NO headings, NO lists, NO tables. Paragraphs only.
 - NO pricing. NO audit fees. NO "our diagnostic is…", NO "from £X", NO commercial terms whatsoever. Cold outbound never quotes prices.
@@ -234,10 +226,6 @@ Return a single JSON object. No markdown, no preamble:
   return { subject: parsed.subject_line, bodyHtml: parsed.email_body_html };
 }
 
-// ---------------------------------------------------------------------------
-// Greeting logic — null-safe, first-name preferred
-// ---------------------------------------------------------------------------
-
 function buildGreeting(ctx: DraftContext): string {
   const first = ctx.firstName ?? (ctx.ownerName ? ctx.ownerName.split(/\s+/)[0] : null);
   if (first && /^[A-Za-z'\-]{2,}$/.test(first)) {
@@ -245,10 +233,6 @@ function buildGreeting(ctx: DraftContext): string {
   }
   return `Hi there,`;
 }
-
-// ---------------------------------------------------------------------------
-// Source-line construction — grounded, not guessed
-// ---------------------------------------------------------------------------
 
 function buildSourceLine(ctx: DraftContext): string {
   if (ctx.sourceKind === "linkedin" && ctx.sourcePage) {
@@ -262,10 +246,6 @@ function buildSourceLine(ctx: DraftContext): string {
   }
   return `you came across them while researching${ctx.city ? ` ${ctx.city}-based` : " UK"} businesses in their sector`;
 }
-
-// ---------------------------------------------------------------------------
-// Scrape context — richer when v2 payload is present
-// ---------------------------------------------------------------------------
 
 function buildScrapeContext(ctx: DraftContext): string {
   const s = ctx.scrape;
@@ -293,10 +273,6 @@ function buildScrapeContext(ctx: DraftContext): string {
   }
   return lines.join("\n");
 }
-
-// ---------------------------------------------------------------------------
-// Lane-specific guidance — steers the "observed pain" paragraph
-// ---------------------------------------------------------------------------
 
 function buildLaneGuidance(ctx: DraftContext): string {
   const lane = (ctx.suggestedLane ?? "").toLowerCase();
@@ -326,10 +302,6 @@ function buildLaneGuidance(ctx: DraftContext): string {
   }
   return `Lane: not specified — pick the most plausible lane from the research signals and anchor the pain paragraph there. Do not mention more than one lane in the email.`;
 }
-
-// ---------------------------------------------------------------------------
-// Post-processing — enforce rules deterministically so the model cannot drift
-// ---------------------------------------------------------------------------
 
 function postProcessSubject(raw: string, maxChars: number): string {
   let s = normaliseCopy(raw);
@@ -404,13 +376,6 @@ function getSenderDomain(): string {
   const cleaned = raw.replace(/^https?:\/\//i, "").replace(/\/$/, "").trim();
   return cleaned || "begility.com";
 }
-
-// ---------------------------------------------------------------------------
-// Send-window guidance — when the orchestrator schedules outreach into a
-// specific calendar window (post year-end, new-director honeymoon, 10-year
-// anniversary, etc), nudge the drafter to lean on the timing as a credible
-// warm hook. Subtle — never name "we waited until your year-end".
-// ---------------------------------------------------------------------------
 
 function buildWindowGuidance(reason: string | null | undefined): string {
   if (!reason) return "";
