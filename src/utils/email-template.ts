@@ -1,11 +1,13 @@
+import { LOGO_CID } from "./email-assets.js";
+
 export function wrapEmailInTemplate(aiGeneratedHtml: string): string {
   const senderName = process.env.SENDER_NAME;
   const senderTitle = process.env.SENDER_TITLE;
   const brandName = process.env.BRAND_NAME ?? "Begility";
   const brandDomain = (process.env.SENDER_EMAIL_DOMAIN ?? "begility.com").replace(/^https?:\/\//i, "").replace(/\/$/, "");
 
-  const logoUrl = process.env.BRAND_LOGO_URL ?? `https://${brandDomain}/logo/logo-begility.png`;
-
+  // Logo is embedded as an inline CID attachment by EmailService.createDraft
+  // — see src/utils/email-assets.ts and src/services/email.service.ts
   return `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1a1a1a; font-size: 14px; line-height: 1.6; max-width: 600px;">
 
@@ -16,7 +18,7 @@ export function wrapEmailInTemplate(aiGeneratedHtml: string): string {
       <table cellpadding="0" cellspacing="0" border="0" style="margin-top: 30px; border-top: 1px solid #eaeaec; padding-top: 20px; width: 100%;">
         <tr>
           <td width="70" style="vertical-align: top; padding-right: 15px;">
-            <img src="${logoUrl}" alt="${brandName}" width="60" style="display: block; max-width: 60px;">
+            <img src="cid:${LOGO_CID}" alt="${brandName}" width="60" style="display: block; max-width: 60px;">
           </td>
           <td style="vertical-align: top;">
             <p style="margin: 0; font-weight: 600; font-size: 15px; color: #000;">${senderName}</p>
